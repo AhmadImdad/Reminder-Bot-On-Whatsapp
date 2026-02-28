@@ -1,0 +1,19 @@
+[Unit]
+Description=WhatsApp Reminder Bot Service
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/reminder-bot
+Environment="PATH=/opt/reminder-bot/venv/bin"
+# Using gunicorn for production instead of pure flask
+ExecStart=/opt/reminder-bot/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 main:app
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=reminder-bot
+
+[Install]
+WantedBy=multi-user.target

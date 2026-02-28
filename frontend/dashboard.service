@@ -1,0 +1,16 @@
+[Unit]
+Description=WhatsApp Reminder Bot Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/reminder-bot/frontend
+Environment="PATH=/opt/reminder-bot/venv/bin"
+# Run Streamlit on Port 3000
+ExecStart=/opt/reminder-bot/venv/bin/streamlit run dashboard.py --server.port 3000 --server.address 0.0.0.0
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

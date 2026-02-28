@@ -1,0 +1,8 @@
+Flask==3.0.0
+groq>=1.0.0
+python-dotenv==1.0.0
+APScheduler==3.10.4
+requests==2.31.0
+pytz==2023.3.post1
+gunicorn==21.2.0
+httpx==0.27.0
