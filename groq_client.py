@@ -49,9 +49,13 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
     Rules for date/time conversion:
     1. If the user says "tomorrow morning", infer the date for tomorrow and time around "09:00".
     2. If the user says "in 2 hours", calculate the relative time based on the Current Date and Time (including weekday) provided above.
-    3. If the user mentions a specific day of the week (e.g., "Saturday this week" or "next Friday"), calculate the correct date relative to the Current Date and Time.
-    4. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00).
-    5. Provide task description precisely, stripping away prefix words like "remind me to".
+    3. Interpretation of weekdays:
+       - "this [day]" or "[day] this week" (e.g., "Saturday this week"): The very next occurrence of that day. If today is Wednesday, "Saturday this week" is the upcoming Saturday.
+       - "next [day]": The occurrence of that day in the following week.
+       - If the user just says "[day]" (e.g., "reminder on Friday"), assume the upcoming one.
+    4. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00, "on 10" -> 10:00).
+    5. Provide task description precisely, stripping away prefix words like "remind me to" or "can you schedule a reminder".
+    6. If a specific day is mentioned but the calculation is ambiguous, use the closest future date matching the description.
     """
     
     try:
@@ -62,7 +66,7 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
                     "content": prompt,
                 }
             ],
-            model="llama-3.1-8b-instant", # Universal active fast model
+            model="llama-3.3-70b-specdec", # Upgraded to more capable model for better logic
             temperature=0.0,
             max_tokens=256,
             response_format={"type": "json_object"}
