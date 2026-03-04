@@ -48,9 +48,10 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
     
     Rules for date/time conversion:
     1. If the user says "tomorrow morning", infer the date for tomorrow and time around "09:00".
-    2. If the user says "in 2 hours", calculate the relative time based on the Current Date and Time provided above.
-    3. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00).
-    4. Provide task description precisely, stripping away prefix words like "remind me to".
+    2. If the user says "in 2 hours", calculate the relative time based on the Current Date and Time (including weekday) provided above.
+    3. If the user mentions a specific day of the week (e.g., "Saturday this week" or "next Friday"), calculate the correct date relative to the Current Date and Time.
+    4. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00).
+    5. Provide task description precisely, stripping away prefix words like "remind me to".
     """
     
     try:

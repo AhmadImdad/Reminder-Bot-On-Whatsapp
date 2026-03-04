@@ -32,7 +32,7 @@ def process_natural_language_reminder(text: str) -> Dict[str, Any]:
     """
     Wrapper around LLM extraction to process natural language into structured data.
     """
-    now_local_str = utc_to_local(datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
+    now_local_str = utc_to_local(datetime.utcnow()).strftime("%A, %Y-%m-%d %H:%M:%S")
     
     # Use LLaMA via Groq to extract details
     extracted_data = extract_reminder_info(text, now_local_str)
