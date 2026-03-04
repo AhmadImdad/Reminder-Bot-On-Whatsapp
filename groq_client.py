@@ -66,7 +66,7 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
                     "content": prompt,
                 }
             ],
-            model="llama-3.3-70b-specdec", # Upgraded to more capable model for better logic
+            model="llama-3.3-70b-versatile", # Using the stable versatile version
             temperature=0.0,
             max_tokens=256,
             response_format={"type": "json_object"}
