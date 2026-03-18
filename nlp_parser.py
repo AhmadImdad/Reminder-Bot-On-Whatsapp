@@ -51,6 +51,13 @@ def process_natural_language_reminder(text: str) -> Dict[str, Any]:
         date_str = extracted_data.get("date")
         time_str = extracted_data.get("time")
         
+        # Default missing times when a date is provided
+        if date_str and not time_str:
+            if intent == "add_task":
+                time_str = "23:59" # End of day for tasks
+            else:
+                time_str = "09:00" # Morning for reminders
+                
         if date_str and time_str:
             parsed_dt = parse_date_time_string(date_str, time_str)
             if not parsed_dt:
