@@ -39,13 +39,19 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
     
     Respond ONLY with a valid JSON object matching this schema exactly, and nothing else:
     {{
-        "intent": string (MUST be one of: "add_reminder", "add_task", "list_tasks", "list_reminders", "remove_task", "complete_task", "none"),
-        "task_description": string (the action or event, e.g. "Buy groceries", or null if not applicable),
-        "date": string (YYYY-MM-DD format, or null if not clear),
-        "time": string (HH:MM format in 24-hour time, or null if not clear),
-        "target_list_id": integer (if removing or completing a specific task by its number in the list, e.g. "remove task 2" -> 2. Otherwise null),
-        "confidence": string ("low", "medium", or "high" based on clarity of intent)
+        "actions": [
+            {{
+                "intent": string (MUST be one of: "add_reminder", "add_task", "list_tasks", "list_reminders", "remove_task", "complete_task", "none"),
+                "task_description": string (the action or event, e.g. "Buy groceries", or null if not applicable),
+                "date": string (YYYY-MM-DD format, or null if not clear),
+                "time": string (HH:MM format in 24-hour time, or null if not clear),
+                "target_list_id": integer (if removing or completing a specific task by its number in the list, e.g. "remove task 2" -> 2. Otherwise null),
+                "confidence": string ("low", "medium", or "high" based on clarity of intent)
+            }}
+        ]
     }}
+    
+    If the user gives multiple commands in one message (e.g., "Add a task to X, then set a reminder for Y"), respond with multiple action objects in the array. If there is only one command, return an array of length 1.
     
     Rules:
     1. If the user asks to be reminded ("remind me to...", "set a reminder"), intent is "add_reminder".

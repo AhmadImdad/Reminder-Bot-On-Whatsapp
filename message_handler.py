@@ -215,105 +215,108 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
         green_api_client.send_message(chat_id, "I couldn't understand that message. Please send text or a voice note.")
         return
         
-    extracted = process_natural_language_reminder(text)
-    intent = extracted.get("intent", "none")
+    extracted_actions = process_natural_language_reminder(text)
     
-    if intent == "none":
-        green_api_client.send_message(chat_id, "I couldn't understand what you want to do. Please try again.")
-        return
+    responses = []
+    show_tasks_table = False
+    show_reminders_table = False
+    
+    for extracted in extracted_actions:
+        intent = extracted.get("intent", "none")
         
-    # Router logic
-    if intent == "list_tasks":
-        tasks = database.get_user_tasks(chat_id)
-        msg = format_tasks_table(tasks)
-        green_api_client.send_message(chat_id, msg)
-        return
-        
-    elif intent == "list_reminders":
-        handle_commands(chat_id, "list reminders")
-        return
-        
-    elif intent == "remove_task":
-        list_id_to_remove = extracted.get("target_list_id")
-        if list_id_to_remove is None:
-            green_api_client.send_message(chat_id, "Please specify which task number you want to remove.")
-            return
-        success = database.delete_task_by_offset(chat_id, list_id_to_remove - 1)
-        if success:
-            tasks = database.get_user_tasks(chat_id)
-            green_api_client.send_message(chat_id, "✅ Task removed.\n\n" + format_tasks_table(tasks))
-        else:
-            green_api_client.send_message(chat_id, f"❌ Could not find active task number {list_id_to_remove}.")
-        return
-        
-    elif intent == "complete_task":
-        list_id_to_complete = extracted.get("target_list_id")
-        if list_id_to_complete is None:
-            green_api_client.send_message(chat_id, "Please specify which task number you want to complete.")
-            return
-        success = database.mark_task_completed_by_offset(chat_id, list_id_to_complete - 1)
-        if success:
-            tasks = database.get_user_tasks(chat_id)
-            green_api_client.send_message(chat_id, "✅ Task completed!\n\n" + format_tasks_table(tasks))
-        else:
-            green_api_client.send_message(chat_id, f"❌ Could not find active task number {list_id_to_complete}.")
-        return
-        
-    elif intent == "add_task":
-        task_desc = extracted.get("task_description", "")
-        if not task_desc:
-            green_api_client.send_message(chat_id, "Please tell me what the task is.")
-            return
+        if intent == "none":
+            responses.append("I couldn't understand part of your request. Please try again.")
+            continue
             
-        dt = None
-        if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
-            dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+        elif intent == "list_tasks":
+            show_tasks_table = True
             
-        database.add_task(chat_id, task_desc, dt)
-        tasks = database.get_user_tasks(chat_id)
-        msg = "✅ Task added successfully!\n\n" + format_tasks_table(tasks)
-        green_api_client.send_message(chat_id, msg)
-        return
-        
-    elif intent == "add_reminder":
-        task = extracted.get("task_description", "")
-        confidence = extracted.get("confidence", "low")
-        
-        if confidence == "high" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
-            # All good, save immediately
-            dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-            database.add_reminder(chat_id, task, dt)
+        elif intent == "list_reminders":
+            show_reminders_table = True
             
-            dt_str = format_datetime_for_user(dt)
-            green_api_client.send_message(chat_id, f"✅ Reminder set: {task} on {dt_str}")
-            
-        elif confidence == "medium" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
-            # Ask for confirmation
-            dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-            dt_str = format_datetime_for_user(dt)
-            
-            msg = f"I understood: {task} on {dt_str}. Is this correct? Reply YES or NO."
-            green_api_client.send_message(chat_id, msg)
-            
-            # Update state
-            context = {
-                "task": task,
-                "parsed_datetime_utc": extracted["parsed_datetime_utc"]
-            }
-            database.update_conversation_state(chat_id, "awaiting_confirmation", context)
-            
-        else:
-            # Missing or ambiguous date/time
-            error_msg = extracted.get("error", "")
-            if error_msg == "The specified time is in the past.":
-                msg = f"You asked to be reminded about: {task}. But the time seems to be in the past. When should I remind you?"
+        elif intent == "remove_task":
+            list_id_to_remove = extracted.get("target_list_id")
+            if list_id_to_remove is None:
+                responses.append("Please specify which task number you want to remove.")
             else:
-                msg = f"I want to remind you about: {task}. When should I remind you? Please provide date and time."
+                success = database.delete_task_by_offset(chat_id, list_id_to_remove - 1)
+                if success:
+                    responses.append(f"✅ Task removed.")
+                    show_tasks_table = True
+                else:
+                    responses.append(f"❌ Could not find active task number {list_id_to_remove}.")
+                    
+        elif intent == "complete_task":
+            list_id_to_complete = extracted.get("target_list_id")
+            if list_id_to_complete is None:
+                responses.append("Please specify which task number you want to complete.")
+            else:
+                success = database.mark_task_completed_by_offset(chat_id, list_id_to_complete - 1)
+                if success:
+                    responses.append(f"✅ Task completed!")
+                    show_tasks_table = True
+                else:
+                    responses.append(f"❌ Could not find active task number {list_id_to_complete}.")
+                    
+        elif intent == "add_task":
+            task_desc = extracted.get("task_description", "")
+            if not task_desc:
+                responses.append("Please tell me what the task is.")
+                continue
                 
-            green_api_client.send_message(chat_id, msg)
+            dt = None
+            if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+                
+            database.add_task(chat_id, task_desc, dt)
+            responses.append(f"✅ Task added successfully!")
+            show_tasks_table = True
             
-            context = {"task": task}
-            database.update_conversation_state(chat_id, "awaiting_datetime", context)
+        elif intent == "add_reminder":
+            task = extracted.get("task_description", "")
+            confidence = extracted.get("confidence", "low")
+            
+            if confidence == "high" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+                database.add_reminder(chat_id, task, dt)
+                
+                dt_str = format_datetime_for_user(dt)
+                responses.append(f"✅ Reminder set: {task} on {dt_str}")
+                
+            elif confidence == "medium" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+                dt_str = format_datetime_for_user(dt)
+                
+                responses.append(f"I understood: {task} on {dt_str}. Is this correct? Reply YES or NO.")
+                context = {
+                    "task": task,
+                    "parsed_datetime_utc": extracted["parsed_datetime_utc"]
+                }
+                database.update_conversation_state(chat_id, "awaiting_confirmation", context)
+                break
+                
+            else:
+                error_msg = extracted.get("error", "")
+                if error_msg == "The specified time is in the past.":
+                    responses.append(f"You asked to be reminded about: {task}. But the time seems to be in the past. When should I remind you?")
+                else:
+                    responses.append(f"I want to remind you about: {task}. When should I remind you? Please provide date and time.")
+                    
+                context = {"task": task}
+                database.update_conversation_state(chat_id, "awaiting_datetime", context)
+                break
+
+    final_msg = "\n".join(responses)
+    if show_tasks_table:
+        tasks = database.get_user_tasks(chat_id)
+        final_msg += ("\n\n" if final_msg else "") + format_tasks_table(tasks)
+        
+    if show_reminders_table:
+        reminders = database.get_user_pending_reminders(chat_id)
+        final_msg += ("\n\n" if final_msg else "") + format_reminders_table(reminders)
+        
+    if final_msg:
+        green_api_client.send_message(chat_id, final_msg)
 
 def handle_confirmation_state(chat_id: str, message_data: Dict[str, Any], message_type: str, context: Dict[str, Any]):
     """Processes yes/no response when awaiting confirmation."""
@@ -344,12 +347,16 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
     task = context["task"]
     combined_prompt = f"Set reminder for: {task}. When: {text}"
     
-    extracted = process_natural_language_reminder(combined_prompt)
+    extracted_actions = process_natural_language_reminder(combined_prompt)
+    if not extracted_actions:
+        green_api_client.send_message(chat_id, "I still couldn't understand the correct time. Please try saying it clearly, like 'Tomorrow at 6 PM'")
+        return
+        
+    extracted = extracted_actions[0]
     
-    if "parsed_datetime_utc" in extracted:
+    if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
         dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-        # We use the previous task description if the LLM lost it, but LLaMA usually retains it
-        final_task = extracted.get("task", task)
+        final_task = extracted.get("task_description", task)
         
         database.add_reminder(chat_id, final_task, dt)
         dt_str = format_datetime_for_user(dt)

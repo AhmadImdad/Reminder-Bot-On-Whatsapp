@@ -28,45 +28,48 @@ def parse_date_time_string(date_str: str, time_str: str) -> Optional[datetime]:
         logger.error(f"Error parsing date/time ({date_str}, {time_str}): {e}")
         return None
 
-def process_natural_language_reminder(text: str) -> Dict[str, Any]:
+def process_natural_language_reminder(text: str) -> list:
     """
     Wrapper around LLM extraction to process natural language into structured data.
+    Returns a list of action dictionaries.
     """
     now_local_str = utc_to_local(datetime.utcnow()).strftime("%A, %Y-%m-%d %H:%M:%S")
     
     # Use LLaMA via Groq to extract details
     extracted_data = extract_reminder_info(text, now_local_str)
     
-    if not extracted_data:
+    if not extracted_data or "actions" not in extracted_data:
         # Fallback if LLM fails
-        return {
+        return [{
             "intent": "none",
             "error": "Failed to extract details.",
             "confidence": "low"
-        }
+        }]
     
-    # Additional validation
-    intent = extracted_data.get("intent", "none")
-    if intent in ["add_reminder", "add_task"]:
-        date_str = extracted_data.get("date")
-        time_str = extracted_data.get("time")
-        
-        # Default missing times when a date is provided
-        if date_str and not time_str:
-            if intent == "add_task":
-                time_str = "23:59" # End of day for tasks
-            else:
-                time_str = "09:00" # Morning for reminders
-                
-        if date_str and time_str:
-            parsed_dt = parse_date_time_string(date_str, time_str)
-            if not parsed_dt:
-                # Date was in the past or invalid
-                extracted_data["confidence"] = "low"
-                extracted_data["date"] = None
-                extracted_data["time"] = None
-                extracted_data["error"] = "The specified time is in the past."
-            else:
-                extracted_data["parsed_datetime_utc"] = parsed_dt.isoformat()
-                
-    return extracted_data
+    actions = extracted_data.get("actions", [])
+    
+    for action in actions:
+        intent = action.get("intent", "none")
+        if intent in ["add_reminder", "add_task"]:
+            date_str = action.get("date")
+            time_str = action.get("time")
+            
+            # Default missing times when a date is provided
+            if date_str and not time_str:
+                if intent == "add_task":
+                    time_str = "23:59" # End of day for tasks
+                else:
+                    time_str = "09:00" # Morning for reminders
+                    
+            if date_str and time_str:
+                parsed_dt = parse_date_time_string(date_str, time_str)
+                if not parsed_dt:
+                    # Date was in the past or invalid
+                    action["confidence"] = "low"
+                    action["date"] = None
+                    action["time"] = None
+                    action["error"] = "The specified time is in the past."
+                else:
+                    action["parsed_datetime_utc"] = parsed_dt.isoformat()
+                    
+    return actions
