@@ -140,16 +140,16 @@ def format_tasks_table(tasks: list) -> str:
     if not tasks:
         return "You have no active tasks."
     
-    table = "```text\n+---+----------------+---------+-------+\n"
-    table += "|ID | Task Name      | End Time|Status |\n"
-    table += "+---+----------------+---------+-------+\n"
+    table = "```text\n+---+------------+----------------+------+\n"
+    table += "|ID | Task Name  | End Time       |Status|\n"
+    table += "+---+------------+----------------+------+\n"
     
     for i, t in enumerate(tasks):
         list_id = i + 1
         name = t['task_name']
-        if len(name) > 14:
-            name = name[:11] + "..."
-        name = name.ljust(14)
+        if len(name) > 10:
+            name = name[:7] + "..."
+        name = name.ljust(10)
         
         end_time = "None"
         if t['end_datetime']:
@@ -158,17 +158,16 @@ def format_tasks_table(tasks: list) -> str:
                 if isinstance(dt_val, str):
                     dt_val = datetime.fromisoformat(dt_val.replace(' ', 'T'))
                 dt = utc_to_local(dt_val.replace(tzinfo=None))
-                end_time = dt.strftime("%I:%M %p")
-                if end_time.startswith("0"): end_time = end_time[1:]
+                end_time = dt.strftime("%d %b %I:%M%p").replace(" 0", " ")
             except Exception as e:
                 logger.error(f"Task Date Error: {e}")
-        end_time = end_time.ljust(7)
+        end_time = end_time[:14].ljust(14)
         
-        status = "Pending" if t['status'] == 'pending' else "Done"
-        status = status.ljust(7)
+        status = "Pend" if t['status'] == 'pending' else "Done"
+        status = status.ljust(6)
         
         table += f"|{str(list_id).ljust(3)}| {name} | {end_time} |{status}|\n"
-        table += "+---+----------------+---------+-------+\n"
+        table += "+---+------------+----------------+------+\n"
     
     table += "```"
     return table
