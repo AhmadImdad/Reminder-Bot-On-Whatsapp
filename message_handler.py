@@ -154,11 +154,14 @@ def format_tasks_table(tasks: list) -> str:
         end_time = "None"
         if t['end_datetime']:
             try:
-                dt = utc_to_local(t['end_datetime'])
+                dt_val = t['end_datetime']
+                if isinstance(dt_val, str):
+                    dt_val = datetime.fromisoformat(dt_val.replace(' ', 'T'))
+                dt = utc_to_local(dt_val.replace(tzinfo=None))
                 end_time = dt.strftime("%I:%M %p")
                 if end_time.startswith("0"): end_time = end_time[1:]
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Task Date Error: {e}")
         end_time = end_time.ljust(7)
         
         status = "Pending" if t['status'] == 'pending' else "Done"
@@ -189,10 +192,13 @@ def format_reminders_table(reminders: list) -> str:
         dt_str = "None"
         if r['reminder_datetime']:
             try:
-                dt = utc_to_local(r['reminder_datetime'])
+                dt_val = r['reminder_datetime']
+                if isinstance(dt_val, str):
+                    dt_val = datetime.fromisoformat(dt_val.replace(' ', 'T'))
+                dt = utc_to_local(dt_val.replace(tzinfo=None))
                 dt_str = dt.strftime("%d %b %I:%M%p").replace(" 0", " ")
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Reminder Date Error: {e}")
         
         dt_str = dt_str[:13].ljust(13)
         
