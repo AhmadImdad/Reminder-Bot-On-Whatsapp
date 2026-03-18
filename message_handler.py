@@ -85,10 +85,7 @@ def handle_commands(chat_id: str, text: str) -> bool:
         if not reminders:
             green_api_client.send_message(chat_id, "You have no pending reminders.")
         else:
-            msg = "📋 **Your Pending Reminders:**\n"
-            for r in reminders:
-                dt_str = format_datetime_for_user(r["reminder_datetime"])
-                msg += f"\n[{r['id']}] {r['task']} - 📅 {dt_str}"
+            msg = format_reminders_table(reminders)
             green_api_client.send_message(chat_id, msg)
         database.update_conversation_state(chat_id, "idle", {})
         return True
@@ -169,6 +166,38 @@ def format_tasks_table(tasks: list) -> str:
         
         table += f"|{str(list_id).ljust(3)}| {name} | {end_time} |{status}|\n"
         table += "+---+----------------+---------+-------+\n"
+    
+    table += "```"
+    return table
+
+def format_reminders_table(reminders: list) -> str:
+    """Formats a list of reminders into an ASCII table optimized for mobile."""
+    if not reminders:
+        return "You have no pending reminders."
+    
+    table = "```text\n+---+----------------+---------------+\n"
+    table += "|ID | Reminder       | Time          |\n"
+    table += "+---+----------------+---------------+\n"
+    
+    for r in reminders:
+        list_id = r['id']
+        name = r['task']
+        if len(name) > 14:
+            name = name[:11] + "..."
+        name = name.ljust(14)
+        
+        dt_str = "None"
+        if r['reminder_datetime']:
+            try:
+                dt = utc_to_local(r['reminder_datetime'])
+                dt_str = dt.strftime("%d %b %I:%M%p").replace(" 0", " ")
+            except:
+                pass
+        
+        dt_str = dt_str[:13].ljust(13)
+        
+        table += f"|{str(list_id).ljust(3)}| {name} | {dt_str} |\n"
+        table += "+---+----------------+---------------+\n"
     
     table += "```"
     return table
