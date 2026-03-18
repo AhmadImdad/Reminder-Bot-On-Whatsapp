@@ -113,3 +113,90 @@ def mark_status(reminder_id: int, status: str):
 def export_reminders_csv() -> str:
     df = get_reminder_history(status='All', days=0) # All time
     return df.to_csv(index=False)
+
+# --- TASKS QUERIES ---
+
+def get_pending_tasks(user_phone: Optional[str] = None) -> pd.DataFrame:
+    with get_db_connection() as conn:
+        query = "SELECT * FROM tasks WHERE status = 'pending'"
+        params = []
+        if user_phone:
+            query += " AND user_phone = ?"
+            params.append(user_phone)
+        query += " ORDER BY end_datetime ASC, created_at DESC"
+        df = pd.read_sql_query(query, conn, params=params)
+        
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(config_dashboard.backend_config.TIMEZONE if hasattr(config_dashboard, 'backend_config') else "UTC")
+        
+        # safely handle datetime parsing when some columns might have empty dates
+        df['end_datetime'] = pd.to_datetime(df['end_datetime'], errors='coerce')
+        if df['end_datetime'].notna().any():
+            df['end_datetime'] = df['end_datetime'].dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+            
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+    return df
+
+def get_task_history(status: str = 'All', days: int = 30) -> pd.DataFrame:
+    with get_db_connection() as conn:
+        query = "SELECT * FROM tasks"
+        params = []
+        
+        conditions = []
+        if status != 'All':
+            conditions.append("status = ?")
+            params.append(status.lower())
+            
+        if days > 0:
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            conditions.append("created_at >= ?")
+            params.append(cutoff_date.isoformat())
+            
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+            
+        query += " ORDER BY created_at DESC"
+        df = pd.read_sql_query(query, conn, params=params)
+        
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(config_dashboard.backend_config.TIMEZONE if hasattr(config_dashboard, 'backend_config') else "UTC")
+        
+        df['end_datetime'] = pd.to_datetime(df['end_datetime'], errors='coerce')
+        if df['end_datetime'].notna().any():
+            df['end_datetime'] = df['end_datetime'].dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+            
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+    return df
+
+def get_task_stats() -> Dict[str, int]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")
+        rows = cursor.fetchall()
+        
+    stats = {'total': 0, 'pending': 0, 'completed': 0}
+    for row in rows:
+        status = row['status']
+        count = row['count']
+        if status in stats:
+            stats[status] = count
+        stats['total'] += count
+    return stats
+
+def delete_task(task_id: int):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+
+def mark_task_status(task_id: int, status: str):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        conn.commit()
+
+def export_tasks_csv() -> str:
+    df = get_task_history(status='All', days=0)
+    return df.to_csv(index=False)

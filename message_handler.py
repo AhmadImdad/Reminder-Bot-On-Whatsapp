@@ -140,16 +140,17 @@ def format_tasks_table(tasks: list) -> str:
     if not tasks:
         return "You have no active tasks."
     
-    table = "```text\n+---+------------+----------------+------+\n"
-    table += "|ID | Task Name  | End Time       |Status|\n"
-    table += "+---+------------+----------------+------+\n"
+    N = max([len(t['task_name']) for t in tasks] + [9])
+    dash_col = "-" * (N + 2)
+    header_col = " Task Name".ljust(N + 2)
+    
+    table = f"```text\n+---+{dash_col}+----------------+------+\n"
+    table += f"|ID |{header_col}| End Time       |Status|\n"
+    table += f"+---+{dash_col}+----------------+------+\n"
     
     for i, t in enumerate(tasks):
         list_id = i + 1
-        name = t['task_name']
-        if len(name) > 10:
-            name = name[:7] + "..."
-        name = name.ljust(10)
+        name = t['task_name'].ljust(N)
         
         end_time = "None"
         if t['end_datetime']:
@@ -167,7 +168,7 @@ def format_tasks_table(tasks: list) -> str:
         status = status.ljust(6)
         
         table += f"|{str(list_id).ljust(3)}| {name} | {end_time} |{status}|\n"
-        table += "+---+------------+----------------+------+\n"
+        table += f"+---+{dash_col}+----------------+------+\n"
     
     table += "```"
     return table
@@ -177,16 +178,17 @@ def format_reminders_table(reminders: list) -> str:
     if not reminders:
         return "You have no pending reminders."
     
-    table = "```text\n+---+----------------+---------------+\n"
-    table += "|ID | Reminder       | Time          |\n"
-    table += "+---+----------------+---------------+\n"
+    N = max([len(r['task']) for r in reminders] + [8])
+    dash_col = "-" * (N + 2)
+    header_col = " Reminder".ljust(N + 2)
+    
+    table = f"```text\n+---+{dash_col}+---------------+\n"
+    table += f"|ID |{header_col}| Time          |\n"
+    table += f"+---+{dash_col}+---------------+\n"
     
     for r in reminders:
         list_id = r['id']
-        name = r['task']
-        if len(name) > 14:
-            name = name[:11] + "..."
-        name = name.ljust(14)
+        name = r['task'].ljust(N)
         
         dt_str = "None"
         if r['reminder_datetime']:
@@ -202,7 +204,7 @@ def format_reminders_table(reminders: list) -> str:
         dt_str = dt_str[:13].ljust(13)
         
         table += f"|{str(list_id).ljust(3)}| {name} | {dt_str} |\n"
-        table += "+---+----------------+---------------+\n"
+        table += f"+---+{dash_col}+---------------+\n"
     
     table += "```"
     return table
