@@ -40,13 +40,14 @@ def process_natural_language_reminder(text: str) -> Dict[str, Any]:
     if not extracted_data:
         # Fallback if LLM fails
         return {
-            "is_reminder": False,
-            "error": "Failed to extract reminder details.",
+            "intent": "none",
+            "error": "Failed to extract details.",
             "confidence": "low"
         }
     
     # Additional validation
-    if extracted_data.get("is_reminder"):
+    intent = extracted_data.get("intent", "none")
+    if intent in ["add_reminder", "add_task"]:
         date_str = extracted_data.get("date")
         time_str = extracted_data.get("time")
         

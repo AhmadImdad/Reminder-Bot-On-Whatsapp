@@ -33,6 +33,18 @@ def init_db():
             )
         ''')
         
+        # Tasks table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_phone TEXT NOT NULL,
+                task_name TEXT NOT NULL,
+                end_datetime DATETIME,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at DATETIME NOT NULL
+            )
+        ''')
+        
         # Messages table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
@@ -162,3 +174,63 @@ def cancel_reminder(reminder_id: int, user_phone: str) -> bool:
         )
         conn.commit()
         return cursor.rowcount > 0
+
+def add_task(user_phone: str, task_name: str, end_datetime: Optional[datetime]) -> int:
+    """Adds a new task to the database."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO tasks (user_phone, task_name, end_datetime, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_phone, task_name, end_datetime, 'pending', now)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+def get_user_tasks(user_phone: str) -> List[sqlite3.Row]:
+    """Gets all tasks for a specific user, ordered by creation."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM tasks WHERE user_phone = ? ORDER BY created_at ASC",
+            (user_phone,)
+        )
+        return cursor.fetchall()
+
+def mark_task_completed_by_offset(user_phone: str, offset_index: int) -> bool:
+    """Marks a task as completed using its displayed list index (0-based offset)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM tasks WHERE user_phone = ? ORDER BY created_at ASC LIMIT 1 OFFSET ?",
+            (user_phone, offset_index)
+        )
+        row = cursor.fetchone()
+        if row:
+            real_id = row['id']
+            cursor.execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?",
+                (real_id,)
+            )
+            conn.commit()
+            return True
+        return False
+
+def delete_task_by_offset(user_phone: str, offset_index: int) -> bool:
+    """Deletes a task using its displayed list index (0-based offset)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM tasks WHERE user_phone = ? ORDER BY created_at ASC LIMIT 1 OFFSET ?",
+            (user_phone, offset_index)
+        )
+        row = cursor.fetchone()
+        if row:
+            real_id = row['id']
+            cursor.execute(
+                "DELETE FROM tasks WHERE id = ?",
+                (real_id,)
+            )
+            conn.commit()
+            return True
+        return False

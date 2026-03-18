@@ -28,34 +28,34 @@ def transcribe_audio(audio_file_path: str) -> Optional[str]:
 def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, Any]]:
     """
     Extracts structured reminder information from raw text using LLaMA.
-    Returns a dictionary containing is_reminder, task, date, time, and confidence.
+    Returns a dictionary containing intent, task_description, date, time, target_list_id and confidence.
     """
     prompt = f"""
-    You are a precise date and time extraction assistant for a reminder bot.
+    You are an intelligent NLP router for a smart WhatsApp bot that handles both Reminders and a Task List.
     Current Date and Time: {current_time}
     
-    Analyze the following user message and extract the reminder details.
+    Analyze the following user message and extract details.
     Message: "{text}"
     
     Respond ONLY with a valid JSON object matching this schema exactly, and nothing else:
     {{
-        "is_reminder": boolean (true if the user is asking to set a reminder, false otherwise),
-        "task": string (the action or event to be reminded about, short and concise),
+        "intent": string (MUST be one of: "add_reminder", "add_task", "list_tasks", "list_reminders", "remove_task", "complete_task", "none"),
+        "task_description": string (the action or event, e.g. "Buy groceries", or null if not applicable),
         "date": string (YYYY-MM-DD format, or null if not clear),
         "time": string (HH:MM format in 24-hour time, or null if not clear),
-        "confidence": string ("low", "medium", or "high" based on clarity of time and intent)
+        "target_list_id": integer (if removing or completing a specific task by its number in the list, e.g. "remove task 2" -> 2. Otherwise null),
+        "confidence": string ("low", "medium", or "high" based on clarity of intent)
     }}
     
-    Rules for date/time conversion:
-    1. If the user says "tomorrow morning", infer the date for tomorrow and time around "09:00".
-    2. If the user says "in 2 hours", calculate the relative time based on the Current Date and Time (including weekday) provided above.
-    3. Interpretation of weekdays:
-       - "this [day]" or "[day] this week" (e.g., "Saturday this week"): The very next occurrence of that day. If today is Wednesday, "Saturday this week" is the upcoming Saturday.
-       - "next [day]": The occurrence of that day in the following week.
-       - If the user just says "[day]" (e.g., "reminder on Friday"), assume the upcoming one.
-    4. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00, "on 10" -> 10:00).
-    5. Provide task description precisely, stripping away prefix words like "remind me to" or "can you schedule a reminder".
-    6. If a specific day is mentioned but the calculation is ambiguous, use the closest future date matching the description.
+    Rules:
+    1. If the user asks to be reminded ("remind me to...", "set a reminder"), intent is "add_reminder".
+    2. If the user asks to add something to their task list or just states a task ("add a task to...", "I need to..."), intent is "add_task".
+    3. Both tasks and reminders can have dates/times. Use Current Date and Time to calculate relatives ("tomorrow", "in 2 hours").
+    4. Provide task description precisely, stripping prefix words like "remind me to" or "add a task to".
+    5. Ensure times are in 24-hour HH:MM format (e.g., 5 PM -> 17:00, "on 10" -> 10:00).
+    6. "list_tasks" vs "list_reminders" depends on what the user asks to see.
+    7. "target_list_id" is only used for remove_task or complete_task, when they specify an ID.
+    8. If a specific day is mentioned but the calculation is ambiguous, use the closest future date matching the description.
     """
     
     try:
