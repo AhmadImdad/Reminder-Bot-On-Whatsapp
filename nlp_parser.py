@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Dict, Any
 
 from utils import local_to_utc, utc_to_local
 from groq_client import extract_reminder_info, classify_idea_intent, classify_note_intent
+import groq_client
 import config
 
 logger = logging.getLogger(__name__)
