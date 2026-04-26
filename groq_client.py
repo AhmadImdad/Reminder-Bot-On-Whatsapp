@@ -74,7 +74,7 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
             ],
             model="llama-3.3-70b-versatile", # Using the stable versatile version
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=1024,
             response_format={"type": "json_object"}
         )
         
@@ -136,7 +136,7 @@ def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=4096,
             response_format={"type": "json_object"}
         )
         response_content = completion.choices[0].message.content
@@ -196,7 +196,7 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=4096,
             response_format={"type": "json_object"}
         )
         response_content = completion.choices[0].message.content
@@ -248,7 +248,7 @@ def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=4096,
             response_format={"type": "json_object"}
         )
         response_content = completion.choices[0].message.content
@@ -299,7 +299,7 @@ def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=4096,
             response_format={"type": "json_object"}
         )
         response_content = completion.choices[0].message.content
