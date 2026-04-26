@@ -179,11 +179,11 @@ def process_resource_message(text: str) -> Optional[dict]:
     """
     Checks if the message is intended for the Resource Store using a fast local regex first.
     If it matches, it calls the LLM for precise extraction.
-    Returns a dict with 'subject' and 'description' if it's a resource, else None.
+    Returns a dict with 'subject' and 'description' if it's a resource.
     """
-    if _last_sentence_contains_resource(text):
-        return groq_client.classify_resource_intent(text)
-    return None
+    if not _last_sentence_contains_resource(text):
+        return {"is_resource": False}
+    return groq_client.classify_resource_intent(text)
 
 def _last_sentence_contains_dump(text: str) -> bool:
     """
@@ -203,8 +203,8 @@ def process_dump_message(text: str) -> Optional[dict]:
     """
     Checks if the message is intended for the Dump Store using a fast local regex first.
     If it matches, it calls the LLM for precise extraction.
-    Returns a dict with 'subject' and 'description' if it's a dump, else None.
+    Returns a dict with 'subject' and 'description' if it's a dump.
     """
-    if _last_sentence_contains_dump(text):
-        return groq_client.classify_dump_intent(text)
-    return None
+    if not _last_sentence_contains_dump(text):
+        return {"is_dump": False}
+    return groq_client.classify_dump_intent(text)
