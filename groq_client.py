@@ -99,24 +99,14 @@ def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
         None if the LLM call fails.
     """
     prompt = f"""
-    You are a strict message classifier for a WhatsApp bot's "Idea Store" feature.
+    You are an AI assistant for a WhatsApp bot's "Idea Store" feature.
 
-    Your ONLY job is to determine if the following message is an idea that the user
-    wants to save, by checking a very specific rule.
+    The following message has already been identified as an idea submission.
+    Your ONLY job is to extract the subject and description perfectly.
 
-    THE RULE:
-    - Read the LAST sentence (or last line) of the message.
-    - If the last sentence contains the word "idea" (in any form, any capitalisation,
-      e.g. "this is an idea", "store idea", "idea box", "just an idea", "idea!"), 
-      the message IS an idea submission.
-    - If the last sentence does NOT contain the word "idea", it is NOT an idea.
-      Even if the rest of the message mentions an idea, only the LAST sentence matters.
-    - Never guess. Apply this rule strictly.
-
-    IF it IS an idea, extract:
+    EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first and last sentence. If there is nothing
-      between first and last sentences, return an empty string "".
+    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
 
     Message:
     ---
@@ -126,9 +116,9 @@ def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_idea": boolean,
-        "subject": string or null,
-        "description": string or null
+        "is_idea": true,
+        "subject": string,
+        "description": string
     }}
     """
     try:
@@ -159,24 +149,14 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
         None if the LLM call fails.
     """
     prompt = f"""
-    You are a strict message classifier for a WhatsApp bot's "Notes Store" feature.
+    You are an AI assistant for a WhatsApp bot's "Notes Store" feature.
 
-    Your ONLY job is to determine if the following message is a note that the user
-    wants to save, by checking a very specific rule.
+    The following message has already been identified as a note submission.
+    Your ONLY job is to extract the subject and description perfectly.
 
-    THE RULE:
-    - Read the LAST sentence (or last line) of the message.
-    - If the last sentence contains the word "note" (in any form, any capitalisation,
-      e.g. "this is a note", "store note", "note box", "just a note", "note!"), 
-      the message IS a note submission.
-    - If the last sentence does NOT contain the word "note", it is NOT a note.
-      Even if the rest of the message mentions a note, only the LAST sentence matters.
-    - Never guess. Apply this rule strictly.
-
-    IF it IS a note, extract:
+    EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first and last sentence. If there is nothing
-      between first and last sentences, return an empty string "".
+    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
 
     Message:
     ---
@@ -186,9 +166,9 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_note": boolean,
-        "subject": string or null,
-        "description": string or null
+        "is_note": true,
+        "subject": string,
+        "description": string
     }}
     """
     try:
@@ -211,24 +191,14 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
 def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
     """Determines if a message is a resource submission by checking if the LAST sentence contains the word 'resource'."""
     prompt = f"""
-    You are a strict message classifier for a WhatsApp bot's "Resources Store" feature.
+    You are an AI assistant for a WhatsApp bot's "Resources Store" feature.
 
-    Your ONLY job is to determine if the following message is a resource that the user
-    wants to save, by checking a very specific rule.
+    The following message has already been identified as a resource submission.
+    Your ONLY job is to extract the subject and description perfectly.
 
-    THE RULE:
-    - Read the LAST sentence (or last line) of the message.
-    - If the last sentence contains the word "resource" (in any form, any capitalisation,
-      e.g. "this is a resource", "store resource", "resource box", "just a resource", "resource!"), 
-      the message IS a resource submission.
-    - If the last sentence does NOT contain the word "resource", it is NOT a resource.
-      Even if the rest of the message mentions a resource, only the LAST sentence matters.
-    - Never guess. Apply this rule strictly.
-
-    IF it IS a resource, extract:
+    EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first and last sentence. If there is nothing
-      between first and last sentences, return an empty string "".
+    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
 
     Message:
     ---
@@ -238,9 +208,9 @@ def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_resource": boolean,
-        "subject": string or null,
-        "description": string or null
+        "is_resource": true,
+        "subject": string,
+        "description": string
     }}
     """
     try:
@@ -262,24 +232,14 @@ def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
 def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
     """Determines if a message is a dump submission by checking if the LAST sentence contains the word 'dump'."""
     prompt = f"""
-    You are a strict message classifier for a WhatsApp bot's "Dump Store" feature.
+    You are an AI assistant for a WhatsApp bot's "Dump Store" feature.
 
-    Your ONLY job is to determine if the following message is a dump that the user
-    wants to save, by checking a very specific rule.
+    The following message has already been identified as a dump submission.
+    Your ONLY job is to extract the subject and description perfectly.
 
-    THE RULE:
-    - Read the LAST sentence (or last line) of the message.
-    - If the last sentence contains the word "dump" (in any form, any capitalisation,
-      e.g. "this is a dump", "store dump", "dump box", "just a dump", "dump!"), 
-      the message IS a dump submission.
-    - If the last sentence does NOT contain the word "dump", it is NOT a dump.
-      Even if the rest of the message mentions a dump, only the LAST sentence matters.
-    - Never guess. Apply this rule strictly.
-
-    IF it IS a dump, extract:
+    EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first and last sentence. If there is nothing
-      between first and last sentences, return an empty string "".
+    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
 
     Message:
     ---
@@ -289,9 +249,9 @@ def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_dump": boolean,
-        "subject": string or null,
-        "description": string or null
+        "is_dump": true,
+        "subject": string,
+        "description": string
     }}
     """
     try:
