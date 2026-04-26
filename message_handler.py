@@ -701,6 +701,8 @@ def _save_idea_media(message_data: Dict[str, Any], message_type: str):
 
     media_type = supported[message_type]
     file_data = message_data.get("fileMessageData", {})
+    if not file_data: file_data = message_data.get("imageMessageData", {})
+    if not file_data: file_data = message_data.get("videoMessageData", {})
     download_url = file_data.get("downloadUrl", "")
     original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
 
@@ -852,6 +854,8 @@ def _save_note_media(message_data: Dict[str, Any], message_type: str):
 
     media_type = supported[message_type]
     file_data = message_data.get("fileMessageData", {})
+    if not file_data: file_data = message_data.get("imageMessageData", {})
+    if not file_data: file_data = message_data.get("videoMessageData", {})
     download_url = file_data.get("downloadUrl", "")
     original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
 
@@ -984,6 +988,8 @@ def _save_resource_media(message_data: Dict[str, Any], message_type: str):
     if message_type not in supported: return None, None, None
     media_type = supported[message_type]
     file_data = message_data.get("fileMessageData", {})
+    if not file_data: file_data = message_data.get("imageMessageData", {})
+    if not file_data: file_data = message_data.get("videoMessageData", {})
     download_url = file_data.get("downloadUrl", "")
     original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
     if not download_url: return None, None, None
@@ -1047,6 +1053,8 @@ def _save_dump_media(message_data: Dict[str, Any], message_type: str):
     if message_type not in supported: return None, None, None
     media_type = supported[message_type]
     file_data = message_data.get("fileMessageData", {})
+    if not file_data: file_data = message_data.get("imageMessageData", {})
+    if not file_data: file_data = message_data.get("videoMessageData", {})
     download_url = file_data.get("downloadUrl", "")
     original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
     if not download_url: return None, None, None
