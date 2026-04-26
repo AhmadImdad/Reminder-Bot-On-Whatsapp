@@ -334,11 +334,22 @@ def handle_commands(chat_id: str, text: str) -> bool:
     return False
 
 def extract_text_from_message(message_data: Dict[str, Any], message_type: str) -> str:
-    """Extracts text from textMessage or transcribes audioMessage."""
+    """Extracts text from textMessage, extendedTextMessage, media captions, or transcribes audioMessage."""
     if message_type == "textMessage":
         return message_data.get("textMessageData", {}).get("textMessage", "")
         
-    elif message_type == "audioMessage": # Or pttMessage
+    elif message_type == "extendedTextMessage":
+        return message_data.get("extendedTextMessageData", {}).get("text", "")
+        
+    elif message_type in ["imageMessage", "videoMessage", "documentMessage"]:
+        caption = message_data.get("fileMessageData", {}).get("caption", "")
+        if not caption:
+            caption = message_data.get("imageMessageData", {}).get("caption", "")
+        if not caption:
+            caption = message_data.get("videoMessageData", {}).get("caption", "")
+        return caption
+        
+    elif message_type in ["audioMessage", "pttMessage"]:
         file_url = message_data.get("fileMessageData", {}).get("downloadUrl", "")
         if not file_url:
             return ""
