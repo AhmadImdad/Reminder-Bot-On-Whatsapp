@@ -28,6 +28,108 @@ DUMP_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dumps
 
 logger = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIVERSAL MEDIA EXTRACTION & DOWNLOAD HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUPPORTED_MEDIA_TYPES = {
+    "imageMessage":    "image",
+    "audioMessage":    "audio",
+    "pttMessage":      "audio",
+    "videoMessage":    "video",
+    "documentMessage": "document",
+}
+
+# All possible Green API data keys where downloadUrl might live
+_MEDIA_DATA_KEYS = [
+    "fileMessageData",
+    "imageMessageData",
+    "videoMessageData",
+    "audioMessageData",
+    "documentMessageData",
+]
+
+
+def _extract_and_save_media(
+    message_data: Dict[str, Any],
+    message_type: str,
+    save_dir: str,
+    section_name: str = "media",
+) -> tuple:
+    """
+    Universal media extractor for all Second Brain sections (Ideas, Notes, Resources, Dumps).
+
+    1. Checks if message_type is a supported media type.
+    2. Searches ALL possible Green API data keys for a downloadUrl.
+    3. Downloads the file and returns (media_type, saved_path, original_name).
+    4. Returns (None, None, None) if the message has no media or download fails.
+    """
+    if message_type not in _SUPPORTED_MEDIA_TYPES:
+        logger.debug(f"[{section_name}] message_type '{message_type}' is not a media type — skipping media save.")
+        return None, None, None
+
+    media_type = _SUPPORTED_MEDIA_TYPES[message_type]
+
+    # Search ALL possible data keys for a downloadUrl
+    download_url = ""
+    original_name = ""
+    source_key = ""
+
+    for key in _MEDIA_DATA_KEYS:
+        data_block = message_data.get(key)
+        if data_block and isinstance(data_block, dict):
+            url_candidate = data_block.get("downloadUrl", "")
+            if url_candidate:
+                download_url = url_candidate
+                original_name = data_block.get("fileName", "")
+                source_key = key
+                logger.info(f"[{section_name}] Found downloadUrl in '{key}'")
+                break
+
+    if not download_url:
+        # Log ALL available keys so we can debug what Green API actually sent
+        available_keys = [k for k in message_data.keys()]
+        logger.warning(
+            f"[{section_name}] No downloadUrl found in any data key. "
+            f"message_type={message_type}, available_keys={available_keys}"
+        )
+        # Last-ditch: try to find downloadUrl anywhere in message_data (nested search)
+        for key, value in message_data.items():
+            if isinstance(value, dict) and "downloadUrl" in value:
+                download_url = value["downloadUrl"]
+                original_name = value.get("fileName", "")
+                source_key = key
+                logger.info(f"[{section_name}] Found downloadUrl via deep scan in '{key}'")
+                break
+
+    if not download_url:
+        logger.error(f"[{section_name}] Giving up: no downloadUrl found anywhere in message_data.")
+        return None, None, None
+
+    # Fallback original name
+    if not original_name:
+        original_name = f"{media_type}_{uuid.uuid4()}"
+
+    # Determine extension safely
+    ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4", "document": "pdf"}
+    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
+    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
+
+    # Generate a safe, collision-proof filename
+    safe_name = f"{uuid.uuid4().hex}.{ext}"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, safe_name)
+
+    logger.info(f"[{section_name}] Downloading {media_type} from {source_key} -> {save_path}")
+
+    if green_api_client.download_file(download_url, save_path):
+        logger.info(f"[{section_name}] Media saved successfully to {save_path}")
+        return media_type, save_path, original_name
+    else:
+        logger.error(f"[{section_name}] download_file() FAILED for url={download_url[:80]}...")
+        return None, None, None
+
 def handle_incoming_webhook(data: Dict[str, Any]):
     """Main entry point for Green API webhooks."""
     try:
@@ -685,47 +787,8 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_idea_media(message_data: Dict[str, Any], message_type: str):
-    """
-    Downloads the media file from a WhatsApp message and saves it to ideas_media/.
-    Returns (media_type, media_path, original_name) or (None, None, None).
-    Supports: imageMessage, audioMessage, pttMessage (voice note), videoMessage.
-    """
-    supported = {
-        "imageMessage": "image",
-        "audioMessage": "audio",
-        "pttMessage":   "audio",
-        "videoMessage": "video",
-    }
-    if message_type not in supported:
-        return None, None, None
-
-    media_type = supported[message_type]
-    file_data = message_data.get("fileMessageData", {})
-    if not file_data: file_data = message_data.get("imageMessageData", {})
-    if not file_data: file_data = message_data.get("videoMessageData", {})
-    download_url = file_data.get("downloadUrl", "")
-    original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
-
-    if not download_url:
-        return None, None, None
-
-    # Determine extension safely
-    ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4"}
-    # Try to get extension from original filename first
-    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
-    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
-
-    # Generate a safe, collision-proof filename
-    safe_name = f"{uuid.uuid4().hex}.{ext}"
-    os.makedirs(IDEA_MEDIA_DIR, exist_ok=True)
-    save_path = os.path.join(IDEA_MEDIA_DIR, safe_name)
-
-    if green_api_client.download_file(download_url, save_path):
-        logger.info(f"Idea media saved to {save_path}")
-        return media_type, save_path, original_name
-    else:
-        logger.error(f"Failed to download idea media from {download_url}")
-        return None, None, None
+    """Downloads media from a WhatsApp message and saves it to ideas_media/."""
+    return _extract_and_save_media(message_data, message_type, IDEA_MEDIA_DIR, "idea")
 
 
 def handle_idea_capture(chat_id: str, idea_result: dict,
@@ -839,43 +902,8 @@ def format_ideas_table(ideas: list) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_note_media(message_data: Dict[str, Any], message_type: str):
-    """
-    Downloads the media file from a WhatsApp message and saves it to notes_media/.
-    Returns (media_type, media_path, original_name) or (None, None, None).
-    """
-    supported = {
-        "imageMessage": "image",
-        "audioMessage": "audio",
-        "pttMessage":   "audio",
-        "videoMessage": "video",
-    }
-    if message_type not in supported:
-        return None, None, None
-
-    media_type = supported[message_type]
-    file_data = message_data.get("fileMessageData", {})
-    if not file_data: file_data = message_data.get("imageMessageData", {})
-    if not file_data: file_data = message_data.get("videoMessageData", {})
-    download_url = file_data.get("downloadUrl", "")
-    original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
-
-    if not download_url:
-        return None, None, None
-
-    ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4"}
-    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
-    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
-
-    safe_name = f"{uuid.uuid4().hex}.{ext}"
-    os.makedirs(NOTE_MEDIA_DIR, exist_ok=True)
-    save_path = os.path.join(NOTE_MEDIA_DIR, safe_name)
-
-    if green_api_client.download_file(download_url, save_path):
-        logger.info(f"Note media saved to {save_path}")
-        return media_type, save_path, original_name
-    else:
-        logger.error(f"Failed to download note media from {download_url}")
-        return None, None, None
+    """Downloads media from a WhatsApp message and saves it to notes_media/."""
+    return _extract_and_save_media(message_data, message_type, NOTE_MEDIA_DIR, "note")
 
 
 def handle_note_capture(chat_id: str, note_result: dict,
@@ -984,24 +1012,8 @@ def format_notes_table(notes: list) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_resource_media(message_data: Dict[str, Any], message_type: str):
-    supported = {"imageMessage": "image", "audioMessage": "audio", "pttMessage": "audio", "videoMessage": "video"}
-    if message_type not in supported: return None, None, None
-    media_type = supported[message_type]
-    file_data = message_data.get("fileMessageData", {})
-    if not file_data: file_data = message_data.get("imageMessageData", {})
-    if not file_data: file_data = message_data.get("videoMessageData", {})
-    download_url = file_data.get("downloadUrl", "")
-    original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
-    if not download_url: return None, None, None
-    ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4"}
-    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
-    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
-    safe_name = f"{uuid.uuid4().hex}.{ext}"
-    os.makedirs(RESOURCE_MEDIA_DIR, exist_ok=True)
-    save_path = os.path.join(RESOURCE_MEDIA_DIR, safe_name)
-    if green_api_client.download_file(download_url, save_path):
-        return media_type, save_path, original_name
-    return None, None, None
+    """Downloads media from a WhatsApp message and saves it to resources_media/."""
+    return _extract_and_save_media(message_data, message_type, RESOURCE_MEDIA_DIR, "resource")
 
 def handle_resource_capture(chat_id: str, result: dict, message_data: Dict[str, Any], message_type: str):
     subject, description = result.get("subject"), result.get("description")
@@ -1049,24 +1061,8 @@ def format_resources_table(items: list) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_dump_media(message_data: Dict[str, Any], message_type: str):
-    supported = {"imageMessage": "image", "audioMessage": "audio", "pttMessage": "audio", "videoMessage": "video"}
-    if message_type not in supported: return None, None, None
-    media_type = supported[message_type]
-    file_data = message_data.get("fileMessageData", {})
-    if not file_data: file_data = message_data.get("imageMessageData", {})
-    if not file_data: file_data = message_data.get("videoMessageData", {})
-    download_url = file_data.get("downloadUrl", "")
-    original_name = file_data.get("fileName", f"{media_type}_{uuid.uuid4()}")
-    if not download_url: return None, None, None
-    ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4"}
-    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
-    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
-    safe_name = f"{uuid.uuid4().hex}.{ext}"
-    os.makedirs(DUMP_MEDIA_DIR, exist_ok=True)
-    save_path = os.path.join(DUMP_MEDIA_DIR, safe_name)
-    if green_api_client.download_file(download_url, save_path):
-        return media_type, save_path, original_name
-    return None, None, None
+    """Downloads media from a WhatsApp message and saves it to dumps_media/."""
+    return _extract_and_save_media(message_data, message_type, DUMP_MEDIA_DIR, "dump")
 
 def handle_dump_capture(chat_id: str, result: dict, message_data: Dict[str, Any], message_type: str):
     subject, description = result.get("subject"), result.get("description")
