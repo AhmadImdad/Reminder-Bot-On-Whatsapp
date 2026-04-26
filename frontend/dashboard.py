@@ -13,6 +13,14 @@ import auth
 from components import upcoming, history, add_reminder, statistics, settings
 # Import new tasks components
 from components import tasks_active, tasks_history, add_task
+# Import idea store component
+from components import ideas
+# Import notes store component
+from components import notes
+# Import resource store component
+from components import resources
+# Import dump store component
+from components import dumps
 
 # --- Authentication hook
 is_authenticated, authenticator = auth.authenticate()
@@ -26,7 +34,10 @@ if is_authenticated:
         # --- Navigation ---
         st.divider()
         st.subheader("Navigation")
-        page = st.radio("Go to", ["⏰ Reminders", "📝 Tasks", "📊 Analytics", "⚙️ Settings"])
+        page = st.radio("Go to", [
+            "⏰ Reminders", "📝 Tasks", "💡 Ideas", "📓 Notes", 
+            "🔗 Resources", "🗑️ Dumps", "📊 Analytics", "⚙️ Settings"
+        ])
         st.divider()
         
         authenticator.logout('Logout', 'sidebar')
@@ -66,6 +77,30 @@ if is_authenticated:
         with col1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Total Tasks</div><div class='metric-value'>{stats.get('total', 0)}</div></div>", unsafe_allow_html=True)
         with col2: st.markdown(f"<div class='metric-card'><div class='metric-label'>Active (Pending)</div><div class='metric-value'>{stats.get('pending', 0)}</div></div>", unsafe_allow_html=True)
         with col3: st.markdown(f"<div class='metric-card'><div class='metric-label'>Completed</div><div class='metric-value' style='color: #28a745;'>{stats.get('completed', 0)}</div></div>", unsafe_allow_html=True)
+
+    elif page == "💡 Ideas":
+        idea_stats = database_queries.get_idea_stats()
+        col1, col2 = st.columns(2)
+        with col1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Total Ideas</div><div class='metric-value' style='color: #f7a800;'>{idea_stats.get('total', 0)}</div></div>", unsafe_allow_html=True)
+        with col2: st.markdown(f"<div class='metric-card'><div class='metric-label'>With Media</div><div class='metric-value' style='color: #6f42c1;'>{idea_stats.get('with_media', 0)}</div></div>", unsafe_allow_html=True)
+
+    elif page == "📓 Notes":
+        note_stats = database_queries.get_note_stats()
+        col1, col2 = st.columns(2)
+        with col1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Total Notes</div><div class='metric-value' style='color: #007bff;'>{note_stats.get('total', 0)}</div></div>", unsafe_allow_html=True)
+        with col2: st.markdown(f"<div class='metric-card'><div class='metric-label'>With Media</div><div class='metric-value' style='color: #e83e8c;'>{note_stats.get('with_media', 0)}</div></div>", unsafe_allow_html=True)
+
+    elif page == "🔗 Resources":
+        res_stats = database_queries.get_resource_stats()
+        col1, col2 = st.columns(2)
+        with col1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Total Resources</div><div class='metric-value' style='color: #17a2b8;'>{res_stats.get('total', 0)}</div></div>", unsafe_allow_html=True)
+        with col2: st.markdown(f"<div class='metric-card'><div class='metric-label'>With Media</div><div class='metric-value' style='color: #20c997;'>{res_stats.get('with_media', 0)}</div></div>", unsafe_allow_html=True)
+
+    elif page == "🗑️ Dumps":
+        dump_stats = database_queries.get_dump_stats()
+        col1, col2 = st.columns(2)
+        with col1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Total Dumps</div><div class='metric-value' style='color: #6c757d;'>{dump_stats.get('total', 0)}</div></div>", unsafe_allow_html=True)
+        with col2: st.markdown(f"<div class='metric-card'><div class='metric-label'>With Media</div><div class='metric-value' style='color: #343a40;'>{dump_stats.get('with_media', 0)}</div></div>", unsafe_allow_html=True)
         
     st.write("") # Spacer
     
@@ -82,6 +117,18 @@ if is_authenticated:
         with tab2: tasks_history.render()
         with tab3: add_task.render()
         
+    elif page == "💡 Ideas":
+        ideas.render()
+
+    elif page == "📓 Notes":
+        notes.render()
+
+    elif page == "🔗 Resources":
+        resources.render()
+
+    elif page == "🗑️ Dumps":
+        dumps.render()
+
     elif page == "📊 Analytics":
         statistics.render()
         

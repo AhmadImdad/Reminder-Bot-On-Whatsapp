@@ -200,3 +200,173 @@ def mark_task_status(task_id: int, status: str):
 def export_tasks_csv() -> str:
     df = get_task_history(status='All', days=0)
     return df.to_csv(index=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDEA STORE QUERIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_all_ideas(search: str = "") -> pd.DataFrame:
+    """Returns all ideas, optionally filtered by subject search string."""
+    with get_db_connection() as conn:
+        if search:
+            df = pd.read_sql_query(
+                "SELECT * FROM ideas WHERE subject LIKE ? ORDER BY created_at DESC",
+                conn,
+                params=[f"%{search}%"]
+            )
+        else:
+            df = pd.read_sql_query(
+                "SELECT * FROM ideas ORDER BY created_at DESC",
+                conn
+            )
+
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(
+            config_dashboard.backend_config.TIMEZONE
+            if hasattr(config_dashboard, 'backend_config') else "UTC"
+        )
+        df['created_at'] = (
+            pd.to_datetime(df['created_at'])
+            .dt.tz_localize('UTC')
+            .dt.tz_convert(tz)
+            .dt.tz_localize(None)
+        )
+    return df
+
+
+def delete_idea_by_id(idea_id: int):
+    """Deletes an idea by its ID (admin action — no user_phone scope on dashboard)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
+        conn.commit()
+
+
+def get_idea_stats() -> dict:
+    """Returns idea count statistics."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM ideas")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM ideas WHERE media_type IS NOT NULL")
+        with_media = cursor.fetchone()[0]
+    return {"total": total, "with_media": with_media}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES STORE QUERIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_all_notes(search: str = "") -> pd.DataFrame:
+    """Returns all notes, optionally filtered by subject search string."""
+    with get_db_connection() as conn:
+        if search:
+            df = pd.read_sql_query(
+                "SELECT * FROM notes WHERE subject LIKE ? ORDER BY created_at DESC",
+                conn,
+                params=[f"%{search}%"]
+            )
+        else:
+            df = pd.read_sql_query(
+                "SELECT * FROM notes ORDER BY created_at DESC",
+                conn
+            )
+
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(
+            config_dashboard.backend_config.TIMEZONE
+            if hasattr(config_dashboard, 'backend_config') else "UTC"
+        )
+        df['created_at'] = (
+            pd.to_datetime(df['created_at'])
+            .dt.tz_localize('UTC')
+            .dt.tz_convert(tz)
+            .dt.tz_localize(None)
+        )
+    return df
+
+
+def delete_note_by_id(note_id: int):
+    """Deletes a note by its ID (admin action on dashboard)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        conn.commit()
+
+
+def get_note_stats() -> dict:
+    """Returns note count statistics."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM notes")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM notes WHERE media_type IS NOT NULL")
+        with_media = cursor.fetchone()[0]
+    return {"total": total, "with_media": with_media}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCE QUERIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_all_resources(search: str = "") -> pd.DataFrame:
+    with get_db_connection() as conn:
+        if search:
+            df = pd.read_sql_query("SELECT * FROM resources WHERE subject LIKE ? ORDER BY created_at DESC", conn, params=[f"%{search}%"])
+        else:
+            df = pd.read_sql_query("SELECT * FROM resources ORDER BY created_at DESC", conn)
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(config_dashboard.backend_config.TIMEZONE if hasattr(config_dashboard, 'backend_config') else "UTC")
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+    return df
+
+def delete_resource_by_id(resource_id: int):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM resources WHERE id = ?", (resource_id,))
+        conn.commit()
+
+def get_resource_stats() -> dict:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM resources")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM resources WHERE media_type IS NOT NULL")
+        with_media = cursor.fetchone()[0]
+    return {"total": total, "with_media": with_media}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DUMP QUERIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_all_dumps(search: str = "") -> pd.DataFrame:
+    with get_db_connection() as conn:
+        if search:
+            df = pd.read_sql_query("SELECT * FROM dumps WHERE subject LIKE ? ORDER BY created_at DESC", conn, params=[f"%{search}%"])
+        else:
+            df = pd.read_sql_query("SELECT * FROM dumps ORDER BY created_at DESC", conn)
+    if not df.empty:
+        import pytz
+        tz = pytz.timezone(config_dashboard.backend_config.TIMEZONE if hasattr(config_dashboard, 'backend_config') else "UTC")
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize('UTC').dt.tz_convert(tz).dt.tz_localize(None)
+    return df
+
+def delete_dump_by_id(dump_id: int):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dumps WHERE id = ?", (dump_id,))
+        conn.commit()
+
+def get_dump_stats() -> dict:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM dumps")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM dumps WHERE media_type IS NOT NULL")
+        with_media = cursor.fetchone()[0]
+    return {"total": total, "with_media": with_media}

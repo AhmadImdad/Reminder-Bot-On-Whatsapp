@@ -58,6 +58,32 @@ def download_file(url: str, file_path: str) -> bool:
                 
     return False
 
+
+def send_file(chat_id: str, file_path: str, file_name: str) -> bool:
+    """Sends a local file (image, audio, video) to a WhatsApp chat via Green API's sendFileByUpload endpoint."""
+    url = f"{get_base_url()}/sendFileByUpload/{config.GREEN_API_TOKEN}"
+    
+    if not os.path.exists(file_path):
+        logger.error(f"send_file: file not found at {file_path}")
+        return False
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_name, f)}
+                data = {"chatId": chat_id, "fileName": file_name}
+                response = requests.post(url, data=data, files=files, timeout=60)
+                response.raise_for_status()
+                logger.info(f"File sent successfully to {chat_id}: {file_name}")
+                return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to send file to {chat_id}, attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+
+    return False
+
 def set_webhook(webhook_url: str) -> bool:
     """Sets the webhook URL for receiving incoming messages."""
     url = f"{get_base_url()}/setSettings/{config.GREEN_API_TOKEN}"

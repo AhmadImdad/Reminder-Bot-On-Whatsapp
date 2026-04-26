@@ -54,3 +54,15 @@ id_rsa
 id_ed25519
 *secret*
 secrets.toml
+
+# Idea Store Media (user uploads — never commit)
+ideas_media/
+
+# Notes Store Media
+notes_media/
+
+# Resources Store Media
+resources_media/
+
+# Dump Store Media
+dumps_media/
