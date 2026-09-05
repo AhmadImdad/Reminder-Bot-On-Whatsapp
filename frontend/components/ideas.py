@@ -93,9 +93,9 @@ def render():
                     if extra_attachments:
                         st.caption(f"**Extra attachments ({len(extra_attachments)}):**")
                         for i, att in enumerate(extra_attachments):
-                            abs_path = att['file_path'] if os.path.isabs(att['file_path']) else os.path.join(
+                            abs_path = att['media_path'] if os.path.isabs(att['media_path']) else os.path.join(
                                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                                att['file_path']
+                                att['media_path']
                             )
                             render_media_item(
                                 att['media_type'], abs_path,

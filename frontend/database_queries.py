@@ -447,7 +447,7 @@ def remove_allowed_user(phone: str) -> tuple[bool, str]:
 def get_attachments(section: str, entry_id: int) -> list:
     """
     Returns all attachment rows for a given section entry.
-    Each row has: id, media_type, file_path, original_name, created_at.
+    Each row has: id, media_type, media_path, original_name, created_at.
     Returns empty list if attachments table doesn't exist yet.
     """
     try:
@@ -455,7 +455,7 @@ def get_attachments(section: str, entry_id: int) -> list:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id, media_type, file_path, original_name, created_at
+                SELECT id, media_type, media_path, original_name, created_at
                 FROM attachments
                 WHERE section = ? AND entry_id = ?
                 ORDER BY created_at ASC

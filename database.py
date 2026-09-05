@@ -1020,8 +1020,9 @@ def get_batch_media(batch_id: str, user_phone: str) -> List[sqlite3.Row]:
 def get_ready_batches() -> List[sqlite3.Row]:
     """
     Returns distinct (batch_id, user_phone) pairs whose batch window
-    has closed (batch_last_updated is older than BATCH_WINDOW_SECONDS)
-    and have not yet been processed (warning_sent = 0).
+    has closed — meaning the LAST file added to the batch is older than
+    BATCH_WINDOW_SECONDS. Uses HAVING MAX(batch_last_updated) to ensure
+    every file in the batch (including the most recently added) has aged out.
     """
     threshold = datetime.utcnow() - timedelta(seconds=BATCH_WINDOW_SECONDS)
     with get_db_connection() as conn:
@@ -1032,8 +1033,8 @@ def get_ready_batches() -> List[sqlite3.Row]:
             FROM temp_media
             WHERE batch_id IS NOT NULL
               AND warning_sent = 0
-              AND batch_last_updated <= ?
             GROUP BY batch_id, user_phone
+            HAVING MAX(batch_last_updated) <= ?
             """,
             (threshold,)
         )

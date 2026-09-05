@@ -90,7 +90,7 @@ def render():
                         st.caption(f"**Extra attachments ({len(extra_attachments)}):**")
                         for i, att in enumerate(extra_attachments):
                             render_media_item(
-                                att['media_type'], _abs(att['file_path']),
+                                att['media_type'], _abs(att['media_path']),
                                 att['original_name'] or f"attachment_{i+1}",
                                 key=f"dump_att_{dump_id}_{i}"
                             )
