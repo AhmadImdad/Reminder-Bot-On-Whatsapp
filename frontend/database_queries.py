@@ -439,3 +439,61 @@ def remove_allowed_user(phone: str) -> tuple[bool, str]:
         conn.commit()
         return True, f"User {phone} and all their data have been deleted."
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ATTACHMENT QUERIES (for frontend card expansion)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_attachments(section: str, entry_id: int) -> list:
+    """
+    Returns all attachment rows for a given section entry.
+    Each row has: id, media_type, file_path, original_name, created_at.
+    Returns empty list if attachments table doesn't exist yet.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, media_type, file_path, original_name, created_at
+                FROM attachments
+                WHERE section = ? AND entry_id = ?
+                ORDER BY created_at ASC
+                """,
+                (section, entry_id)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE FUNCTIONS (called by frontend delete buttons)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def delete_idea_by_id(idea_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM attachments WHERE section = 'idea' AND entry_id = ?", (idea_id,))
+        conn.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
+        conn.commit()
+
+
+def delete_note_by_id(note_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM attachments WHERE section = 'note' AND entry_id = ?", (note_id,))
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        conn.commit()
+
+
+def delete_resource_by_id(resource_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM attachments WHERE section = 'resource' AND entry_id = ?", (resource_id,))
+        conn.execute("DELETE FROM resources WHERE id = ?", (resource_id,))
+        conn.commit()
+
+
+def delete_dump_by_id(dump_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM attachments WHERE section = 'dump' AND entry_id = ?", (dump_id,))
+        conn.execute("DELETE FROM dumps WHERE id = ?", (dump_id,))
+        conn.commit()

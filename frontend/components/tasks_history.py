@@ -43,7 +43,7 @@ def render():
     
     # Render table
     st.dataframe(
-        display_df.style.applymap(styler, subset=['Status']),
+        display_df.style.map(styler, subset=['Status']),
         use_container_width=True,
         hide_index=True
     )

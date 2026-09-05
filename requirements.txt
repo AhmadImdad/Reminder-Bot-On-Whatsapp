@@ -7,3 +7,5 @@ pytz==2023.3.post1
 gunicorn==21.2.0
 httpx==0.28.1
 google-genai>=2.22.0
+streamlit
+streamlit-authenticator

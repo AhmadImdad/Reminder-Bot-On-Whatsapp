@@ -4,16 +4,14 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database_queries
+from components.media_renderer import render_media_item
 
 
 def render():
     st.header("💡 Idea Store")
     st.caption("All ideas captured from WhatsApp, newest first.")
 
-    # ── Search bar ─────────────────────────────────────────────────────────────
     search = st.text_input("🔍 Search by subject...", key="idea_search")
-
-    # ── Fetch data ─────────────────────────────────────────────────────────────
     df = database_queries.get_all_ideas(search=search)
 
     if df.empty:
@@ -27,7 +25,6 @@ def render():
             )
         return
 
-    # ── Stats row ──────────────────────────────────────────────────────────────
     total = len(df)
     with_media = int(df['media_type'].notna().sum())
     col1, col2 = st.columns(2)
@@ -38,7 +35,6 @@ def render():
 
     st.divider()
 
-    # ── Export ─────────────────────────────────────────────────────────────────
     csv = df.to_csv(index=False)
     st.download_button(
         "⬇️ Export All as CSV",
@@ -46,20 +42,18 @@ def render():
         file_name="ideas_export.csv",
         mime="text/csv",
     )
+    st.write("")
 
-    st.write("")  # spacer
-
-    # ── Idea cards ─────────────────────────────────────────────────────────────
     for _, row in df.iterrows():
-        idea_id = int(row['id'])
-        subject = row['subject']
-        description = row.get('description') or ""
-        media_type = row.get('media_type')
-        media_path = row.get('media_path')
-        created_at = row.get('created_at')
+        idea_id      = int(row['id'])
+        subject      = row['subject']
+        description  = row.get('description') or ""
+        media_type   = row.get('media_type')
+        media_path   = row.get('media_path')
+        original_name = row.get('media_original_name') or ""
+        created_at   = row.get('created_at')
 
         with st.container(border=True):
-            # Header row: ID + subject + date
             header_col, date_col = st.columns([3, 1])
             with header_col:
                 st.markdown(f"### 💡 #{idea_id} — {subject}")
@@ -70,36 +64,45 @@ def render():
                     except Exception:
                         st.caption(str(created_at))
 
-            # Description
             if description:
                 st.markdown(f"**📝 Description:** {description}")
             else:
                 st.caption("_(No description)_")
 
-            # Media preview
-            if media_type and media_path:
-                if os.path.exists(media_path):
-                    if media_type == "image":
-                        st.image(media_path, caption="Attached Image", use_column_width=True)
-                    elif media_type in ("audio", "video"):
-                        with open(media_path, "rb") as f:
-                            media_bytes = f.read()
-                        original_name = row.get('media_original_name') or f"idea_{idea_id}_attachment"
-                        mime = "audio/ogg" if media_type == "audio" else "video/mp4"
-                        st.download_button(
-                            label=f"🎵 Download {media_type.capitalize()} — {original_name}",
-                            data=media_bytes,
-                            file_name=original_name,
-                            mime=mime,
-                            key=f"dl_media_{idea_id}"
-                        )
-                else:
-                    st.warning(f"⚠️ Attached {media_type} file not found on server.")
-            
-            # Phone / owner tag
             st.caption(f"📞 From: {row.get('user_phone', 'Unknown')}")
 
-            # Delete button
+            # ── Expand to see media ───────────────────────────────────────────
+            has_primary    = bool(media_type and media_path)
+            extra_attachments = database_queries.get_attachments("idea", idea_id)
+            total_media    = (1 if has_primary else 0) + len(extra_attachments)
+
+            if total_media > 0:
+                label = f"📎 View {total_media} attachment(s)"
+                with st.expander(label, expanded=False):
+                    if has_primary:
+                        st.caption("**Primary media:**")
+                        abs_path = media_path if os.path.isabs(media_path) else os.path.join(
+                            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                            media_path
+                        )
+                        render_media_item(
+                            media_type, abs_path, original_name,
+                            key=f"idea_primary_{idea_id}"
+                        )
+
+                    if extra_attachments:
+                        st.caption(f"**Extra attachments ({len(extra_attachments)}):**")
+                        for i, att in enumerate(extra_attachments):
+                            abs_path = att['file_path'] if os.path.isabs(att['file_path']) else os.path.join(
+                                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                att['file_path']
+                            )
+                            render_media_item(
+                                att['media_type'], abs_path,
+                                att['original_name'] or f"attachment_{i+1}",
+                                key=f"idea_att_{idea_id}_{i}"
+                            )
+
             if st.button("🗑️ Delete", key=f"del_idea_{idea_id}"):
                 database_queries.delete_idea_by_id(idea_id)
                 st.error(f"Idea #{idea_id} deleted.")

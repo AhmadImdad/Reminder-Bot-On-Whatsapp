@@ -937,10 +937,11 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
 
 def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_type: str):
     """
-    Called when a media message (image/video/document/sticker) arrives in idle state.
-    1. Downloads and saves the file to temp_media/ immediately.
-    2. Checks caption for high-confidence intent → auto-route.
-    3. Otherwise asks the user what to do.
+    Called when a media message arrives in idle state.
+    Saves file immediately (Meta URLs are short-lived), then adds it to the
+    user's current open batch. The batch is processed by the scheduler after
+    the 15-second window closes with no new arrivals.
+    Multiple files sent in quick succession are silently accumulated.
     """
     media_type, temp_path, original_name = _extract_and_save_media(
         message_data, message_type, TEMP_MEDIA_DIR, "temp"
@@ -953,34 +954,35 @@ def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_t
         )
         return
 
-    # Store in temp_media table
-    temp_id = database.add_temp_media(chat_id, temp_path, media_type, original_name)
+    # Extract caption (only the first image in a multi-send has one)
+    caption = (message_data.get(message_type) or {}).get("caption", "").strip() or None
 
-    # Check caption
-    caption = message_data.get(message_type, {}).get("caption", "").strip()
+    # Check if user already has an open batch within the 15s window
+    existing_batch_id = database.get_open_batch_for_user(chat_id)
 
-    if caption:
-        result = process_media_caption(caption)
-        confidence = result.get("confidence", "low")
+    if existing_batch_id:
+        # Silently add to existing batch — reset its window
+        temp_id = database.add_temp_media(
+            chat_id, temp_path, media_type, original_name,
+            caption=caption, batch_id=existing_batch_id
+        )
+        # Update batch_last_updated so window resets
+        database.assign_to_batch(temp_id, existing_batch_id)
+        logger.info(
+            f"Added file to existing batch {existing_batch_id} for {chat_id} "
+            f"(total files in batch now accumulating)"
+        )
+    else:
+        # First file — create a new batch
+        new_batch_id = str(uuid.uuid4())
+        database.add_temp_media(
+            chat_id, temp_path, media_type, original_name,
+            caption=caption, batch_id=new_batch_id
+        )
+        logger.info(f"Created new media batch {new_batch_id} for {chat_id}")
 
-        if confidence == "high":
-            # High confidence — act immediately
-            success = _execute_media_intent(chat_id, result, temp_id, temp_path, media_type, original_name)
-            if success:
-                return
-            # If execution failed, fall through to ask user
-
-    # Ask user what to do
-    pending_note = f"\n_File: {original_name}_" if original_name else ""
-    database.update_conversation_state(chat_id, "awaiting_media_intent", {"temp_id": temp_id})
-    green_api_client.send_message(
-        chat_id,
-        f"📎 *Got your {media_type}!*{pending_note}\n\n"
-        "What should I do with it? Reply with:\n"
-        "- *new idea* / *new note* / *new resource* / *new dump*\n"
-        "- *attach to idea 3* (or any section + ID)\n"
-        "- *discard* to delete it"
-    )
+    # Do NOT send any message yet — wait for the batch window to close
+    # The scheduler's process_ready_media_batches() will handle it
 
 
 def _execute_media_intent(chat_id: str, intent_result: dict,
@@ -1095,15 +1097,228 @@ def _discard_temp_media(chat_id: str, temp_id: int, temp_path: str):
     database.delete_temp_media(temp_id)
 
 
+def _discard_batch(chat_id: str, batch_id: str):
+    """Deletes all files in a batch from disk and removes DB rows."""
+    rows = database.get_batch_media(batch_id, chat_id)
+    for row in rows:
+        abs_path = _resolve_media_path(row["file_path"])
+        try:
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+        except Exception as e:
+            logger.error(f"Failed to delete batch file {abs_path}: {e}")
+    database.delete_batch_media(batch_id)
+
+
+def process_media_batch(batch_id: str, user_phone: str, caption: str):
+    """
+    Called by the scheduler once a batch's 15-second window has closed.
+    Processes all media files in the batch together as one unit.
+    Caption from the first file applies to all.
+    """
+    rows = database.get_batch_media(batch_id, user_phone)
+    if not rows:
+        logger.warning(f"Batch {batch_id} has no rows — skipping")
+        return
+
+    file_count = len(rows)
+    file_word  = "file" if file_count == 1 else "files"
+    icon_map   = {"image": "🖼️", "video": "🎥", "audio": "🎤", "document": "📄", "sticker": "🙌"}
+    type_summary = ", ".join(
+        f"{icon_map.get(r['media_type'], '📎')}{r['original_name'] or r['media_type']}"
+        for r in rows
+    )
+
+    if caption:
+        result     = process_media_caption(caption)
+        confidence = result.get("confidence", "low")
+    else:
+        result     = {"intent": "unclear", "confidence": "low"}
+        confidence = "low"
+
+    if confidence == "high":
+        success = _execute_batch_intent(user_phone, result, batch_id, rows)
+        if success:
+            return
+        # If execution failed, fall through to ask
+
+    elif confidence == "medium":
+        section  = result.get("section", "unknown")
+        entry_id = result.get("entry_id")
+        if entry_id:
+            prompt = (
+                f"📦 I received *{file_count} {file_word}*: {type_summary}\n\n"
+                f"I think you want to attach them all to *{section} #{entry_id}*. "
+                f"Is that right? Reply *YES* or *NO*."
+            )
+        else:
+            prompt = (
+                f"📦 I received *{file_count} {file_word}*: {type_summary}\n\n"
+                f"I think you want to save them all as a new *{section}*. "
+                f"Is that right? Reply *YES* or *NO*."
+            )
+        database.update_conversation_state(user_phone, "awaiting_media_intent", {
+            "batch_id": batch_id,
+            "pending_result": result
+        })
+        green_api_client.send_message(user_phone, prompt)
+        return
+
+    # Low confidence or no caption — ask user once for the whole batch
+    database.update_conversation_state(user_phone, "awaiting_media_intent", {"batch_id": batch_id})
+    green_api_client.send_message(
+        user_phone,
+        f"📦 I received *{file_count} {file_word}*:\n{type_summary}\n\n"
+        "What should I do with them? Reply with:\n"
+        "- *new idea* / *new note* / *new resource* / *new dump*\n"
+        "- *attach to idea 3* (or any section + ID)\n"
+        "- *discard* to delete them all"
+    )
+
+
+def _execute_batch_intent(user_phone: str, intent_result: dict,
+                          batch_id: str, rows: list) -> bool:
+    """
+    Executes an intent against an entire batch.
+    - attach_to_existing: all files added as attachments to the target entry
+    - new_*: first file becomes primary media, rest become attachments
+    - discard: deletes everything
+    Returns True on success.
+    """
+    intent   = intent_result.get("intent", "unclear")
+    section  = intent_result.get("section")
+    entry_id = intent_result.get("entry_id")
+    subject  = intent_result.get("subject") or f"Media batch — {datetime.utcnow().strftime('%b %d, %Y')}"
+    icon_map = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}
+
+    if intent == "discard":
+        _discard_batch(user_phone, batch_id)
+        database.update_conversation_state(user_phone, "idle", {})
+        green_api_client.send_message(user_phone, f"🗑️ All {len(rows)} file(s) discarded.")
+        return True
+
+    if intent == "unclear" or not section:
+        return False
+
+    section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+    icon        = icon_map.get(section, "📎")
+
+    # ── Attach all files to an existing entry ─────────────────────────────────
+    if intent == "attach_to_existing" and entry_id:
+        attached = 0
+        for row in rows:
+            new_path = _move_temp_to_section(row["file_path"], section_dir)
+            if new_path:
+                database.add_attachment(
+                    section, entry_id, user_phone,
+                    row["media_type"], new_path, row["original_name"]
+                )
+                attached += 1
+        database.delete_batch_media(batch_id)
+        database.update_conversation_state(user_phone, "idle", {})
+        green_api_client.send_message(
+            user_phone,
+            f"📎 {icon} *{attached} attachment(s)* added to *{section.capitalize()} #{entry_id}*!"
+        )
+        return True
+
+    # ── Create new entry with all files ──────────────────────────────────────
+    if intent in ["new_idea", "new_note", "new_resource", "new_dump"]:
+        first = rows[0]
+        rest  = rows[1:]
+
+        # First file → primary media on the entry
+        first_path = _move_temp_to_section(first["file_path"], section_dir)
+        if not first_path:
+            return False
+
+        entry_id_new = _save_new_section_entry(
+            user_phone, section, subject, None,
+            first["media_type"], first_path, first["original_name"]
+        )
+
+        # Remaining files → attachments
+        for row in rest:
+            new_path = _move_temp_to_section(row["file_path"], section_dir)
+            if new_path:
+                database.add_attachment(
+                    section, entry_id_new, user_phone,
+                    row["media_type"], new_path, row["original_name"]
+                )
+
+        database.delete_batch_media(batch_id)
+        database.update_conversation_state(user_phone, "idle", {})
+
+        extra = f" + {len(rest)} more attachment(s)" if rest else ""
+        green_api_client.send_message(
+            user_phone,
+            f"{icon} *{section.capitalize()} #{entry_id_new} saved!*\n"
+            f"📌 *Subject:* {subject}\n"
+            f"📎 1 primary media{extra}"
+        )
+        return True
+
+    return False
+
+
+
 def handle_awaiting_media_intent_state(chat_id: str, message_data: Dict[str, Any],
                                         message_type: str, context: Dict[str, Any]):
     """
-    User replied to the 'what should I do with your file?' prompt.
-    Parses their reply and routes the temp media accordingly.
+    User replied to the 'what should I do with your files?' prompt.
+    Works on a whole batch (batch_id in context) or a single file (temp_id, legacy).
     """
-    text = extract_text_from_message(message_data, message_type).strip()
-    temp_id = context.get("temp_id")
+    # If more media arrives while waiting — add it to the batch silently
+    if message_type in ("image", "video", "audio", "document", "sticker"):
+        _handle_incoming_media(chat_id, message_data, message_type)
+        return
 
+    text       = extract_text_from_message(message_data, message_type).strip()
+    batch_id   = context.get("batch_id")
+    temp_id    = context.get("temp_id")   # legacy single-file fallback
+
+    # ── Handle batch ──────────────────────────────────────────────────────────
+    if batch_id:
+        rows = database.get_batch_media(batch_id, chat_id)
+        if not rows:
+            green_api_client.send_message(chat_id, "⚠️ Could not find your pending files. They may have been discarded.")
+            database.update_conversation_state(chat_id, "idle", {})
+            return
+
+        result     = process_media_caption(text)
+        confidence = result.get("confidence", "low")
+
+        if confidence == "high":
+            success = _execute_batch_intent(chat_id, result, batch_id, rows)
+            if success:
+                return
+
+        elif confidence == "medium":
+            section  = result.get("section", "unknown")
+            entry_id = result.get("entry_id")
+            count    = len(rows)
+            if entry_id:
+                msg = f"I think you want to attach all {count} file(s) to *{section} #{entry_id}*. Is that right? Reply *YES* or *NO*."
+            else:
+                msg = f"I think you want to save all {count} file(s) as a new *{section}*. Is that right? Reply *YES* or *NO*."
+            green_api_client.send_message(chat_id, msg)
+            database.update_conversation_state(chat_id, "awaiting_media_intent", {
+                "batch_id": batch_id,
+                "pending_result": result
+            })
+            return
+
+        # Low confidence — ask again
+        green_api_client.send_message(
+            chat_id,
+            "I couldn't understand that. Please reply with:\n"
+            "- *new idea* / *new note* / *new resource* / *new dump*\n"
+            "- *attach to idea 3* (or any section + ID)\n"
+            "- *discard* to delete all files"
+        )
+        return
+
+    # ── Legacy single-file fallback ───────────────────────────────────────────
     if not temp_id:
         database.update_conversation_state(chat_id, "idle", {})
         return
@@ -1114,41 +1329,31 @@ def handle_awaiting_media_intent_state(chat_id: str, message_data: Dict[str, Any
         database.update_conversation_state(chat_id, "idle", {})
         return
 
-    temp_path    = temp_row["file_path"]
-    media_type   = temp_row["media_type"]
+    temp_path     = temp_row["file_path"]
+    media_type    = temp_row["media_type"]
     original_name = temp_row["original_name"] or ""
 
-    # Parse the user's reply
-    result = process_media_caption(text)
+    result     = process_media_caption(text)
     confidence = result.get("confidence", "low")
 
     if confidence == "high":
         success = _execute_media_intent(chat_id, result, temp_id, temp_path, media_type, original_name)
         if success:
             return
-        # Fall through to ask again
 
     elif confidence == "medium":
         section  = result.get("section", "unknown")
         entry_id = result.get("entry_id")
-        if entry_id:
-            green_api_client.send_message(
-                chat_id,
-                f"I think you want to attach this to *{section} #{entry_id}*. Is that right? Reply *YES* or *NO*."
-            )
-        else:
-            green_api_client.send_message(
-                chat_id,
-                f"I think you want to save this as a new *{section}*. Is that right? Reply *YES* or *NO*."
-            )
-        # Keep state, store richer context
+        msg = (
+            f"I think you want to attach this to *{section} #{entry_id}*." if entry_id
+            else f"I think you want to save this as a new *{section}*."
+        ) + " Is that right? Reply *YES* or *NO*."
+        green_api_client.send_message(chat_id, msg)
         database.update_conversation_state(chat_id, "awaiting_media_intent", {
-            "temp_id": temp_id,
-            "pending_result": result
+            "temp_id": temp_id, "pending_result": result
         })
         return
 
-    # Low confidence or unclear — give clear options again
     green_api_client.send_message(
         chat_id,
         "I couldn't understand that. Please reply with:\n"

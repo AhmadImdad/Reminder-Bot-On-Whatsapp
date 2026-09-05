@@ -168,16 +168,30 @@ def init_db():
         # Temporary media staging — holds files while user decides where to save them
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS temp_media (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_phone    TEXT NOT NULL,
-                file_path     TEXT NOT NULL,
-                media_type    TEXT NOT NULL,
-                original_name TEXT,
-                saved_at      DATETIME NOT NULL,
-                warning_sent  INTEGER DEFAULT 0,
-                expires_at    DATETIME
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_phone          TEXT NOT NULL,
+                file_path           TEXT NOT NULL,
+                media_type          TEXT NOT NULL,
+                original_name       TEXT,
+                caption             TEXT,
+                batch_id            TEXT,
+                batch_last_updated  DATETIME,
+                saved_at            DATETIME NOT NULL,
+                warning_sent        INTEGER DEFAULT 0,
+                expires_at          DATETIME
             )
         ''')
+
+        # Safe migration for existing databases — add new columns if they don't exist
+        for col, col_type in [
+            ("caption",            "TEXT"),
+            ("batch_id",           "TEXT"),
+            ("batch_last_updated", "DATETIME"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE temp_media ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # column already exists
 
         conn.commit()
     logger.info("Database initialized successfully.")
@@ -845,7 +859,9 @@ def delete_attachments_for_entry(section: str, entry_id: int, user_phone: str) -
 # ──────────────────────────────────────────────────────────────────────────────
 
 def add_temp_media(user_phone: str, file_path: str,
-                   media_type: str, original_name: Optional[str] = None) -> int:
+                   media_type: str, original_name: Optional[str] = None,
+                   caption: Optional[str] = None,
+                   batch_id: Optional[str] = None) -> int:
     """Saves a new temp_media row and returns its ID."""
     now = datetime.utcnow()
     with get_db_connection() as conn:
@@ -853,10 +869,12 @@ def add_temp_media(user_phone: str, file_path: str,
         cursor.execute(
             """
             INSERT INTO temp_media (user_phone, file_path, media_type, original_name,
+                                    caption, batch_id, batch_last_updated,
                                     saved_at, warning_sent, expires_at)
-            VALUES (?, ?, ?, ?, ?, 0, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
             """,
-            (user_phone, file_path, media_type, original_name, now)
+            (user_phone, file_path, media_type, original_name,
+             caption, batch_id, now, now)
         )
         conn.commit()
         return cursor.lastrowid
@@ -941,3 +959,99 @@ def get_temp_media_by_id(row_id: int, user_phone: str) -> Optional[sqlite3.Row]:
             (row_id, user_phone)
         )
         return cursor.fetchone()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BATCH MEDIA HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+BATCH_WINDOW_SECONDS = 15
+
+
+def get_open_batch_for_user(user_phone: str) -> Optional[str]:
+    """
+    Returns the batch_id of the user's currently open batch (if any),
+    i.e. a batch whose batch_last_updated is within the 15-second window.
+    Returns None if no open batch exists.
+    """
+    threshold = datetime.utcnow() - timedelta(seconds=BATCH_WINDOW_SECONDS)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT batch_id FROM temp_media
+            WHERE user_phone = ? AND batch_id IS NOT NULL
+              AND warning_sent = 0
+              AND batch_last_updated > ?
+            ORDER BY batch_last_updated DESC LIMIT 1
+            """,
+            (user_phone, threshold)
+        )
+        row = cursor.fetchone()
+        return row["batch_id"] if row else None
+
+
+def assign_to_batch(temp_id: int, batch_id: str) -> None:
+    """Assigns a temp_media row to a batch and refreshes batch_last_updated."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE temp_media SET batch_id = ?, batch_last_updated = ? WHERE id = ?",
+            (batch_id, now, temp_id)
+        )
+        conn.commit()
+
+
+def get_batch_media(batch_id: str, user_phone: str) -> List[sqlite3.Row]:
+    """Returns all temp_media rows for a batch, ordered by saved_at."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM temp_media
+            WHERE batch_id = ? AND user_phone = ?
+            ORDER BY saved_at ASC
+            """,
+            (batch_id, user_phone)
+        )
+        return cursor.fetchall()
+
+
+def get_ready_batches() -> List[sqlite3.Row]:
+    """
+    Returns distinct (batch_id, user_phone) pairs whose batch window
+    has closed (batch_last_updated is older than BATCH_WINDOW_SECONDS)
+    and have not yet been processed (warning_sent = 0).
+    """
+    threshold = datetime.utcnow() - timedelta(seconds=BATCH_WINDOW_SECONDS)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT batch_id, user_phone, MIN(caption) AS caption
+            FROM temp_media
+            WHERE batch_id IS NOT NULL
+              AND warning_sent = 0
+              AND batch_last_updated <= ?
+            GROUP BY batch_id, user_phone
+            """,
+            (threshold,)
+        )
+        return cursor.fetchall()
+
+
+def mark_batch_processing(batch_id: str) -> None:
+    """Marks all rows in a batch as warning_sent=1 so they aren't picked up again."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE temp_media SET warning_sent = 1 WHERE batch_id = ?",
+            (batch_id,)
+        )
+        conn.commit()
+
+
+def delete_batch_media(batch_id: str) -> None:
+    """Deletes all temp_media rows for a batch (caller deletes files first)."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM temp_media WHERE batch_id = ?", (batch_id,))
+        conn.commit()

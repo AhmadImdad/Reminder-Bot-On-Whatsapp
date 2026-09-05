@@ -4,16 +4,20 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database_queries
+from components.media_renderer import render_media_item
+
+_BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(_BASE, path)
 
 
 def render():
     st.header("🗑️ Dump Store")
     st.caption("All dumps captured from WhatsApp, newest first.")
 
-    # ── Search bar ─────────────────────────────────────────────────────────────
     search = st.text_input("🔍 Search by subject...", key="dump_search")
-
-    # ── Fetch data ─────────────────────────────────────────────────────────────
     df = database_queries.get_all_dumps(search=search)
 
     if df.empty:
@@ -27,7 +31,6 @@ def render():
             )
         return
 
-    # ── Stats row ──────────────────────────────────────────────────────────────
     total = len(df)
     with_media = int(df['media_type'].notna().sum())
     col1, col2 = st.columns(2)
@@ -38,7 +41,6 @@ def render():
 
     st.divider()
 
-    # ── Export ─────────────────────────────────────────────────────────────────
     csv = df.to_csv(index=False)
     st.download_button(
         "⬇️ Export All as CSV",
@@ -46,17 +48,16 @@ def render():
         file_name="dumps_export.csv",
         mime="text/csv",
     )
+    st.write("")
 
-    st.write("")  # spacer
-
-    # ── Dump cards ─────────────────────────────────────────────────────────────
     for _, row in df.iterrows():
-        dump_id = int(row['id'])
-        subject = row['subject']
-        description = row.get('description') or ""
-        media_type = row.get('media_type')
-        media_path = row.get('media_path')
-        created_at = row.get('created_at')
+        dump_id      = int(row['id'])
+        subject      = row['subject']
+        description  = row.get('description') or ""
+        media_type   = row.get('media_type')
+        media_path   = row.get('media_path')
+        original_name = row.get('media_original_name') or ""
+        created_at   = row.get('created_at')
 
         with st.container(border=True):
             header_col, date_col = st.columns([3, 1])
@@ -74,27 +75,25 @@ def render():
             else:
                 st.caption("_(No description)_")
 
-            # Media preview / download
-            if media_type and media_path:
-                if os.path.exists(media_path):
-                    if media_type == "image":
-                        st.image(media_path, caption="Attached Image", use_column_width=True)
-                    elif media_type in ("audio", "video"):
-                        with open(media_path, "rb") as f:
-                            media_bytes = f.read()
-                        original_name = row.get('media_original_name') or f"dump_{dump_id}_attachment"
-                        mime = "audio/ogg" if media_type == "audio" else "video/mp4"
-                        st.download_button(
-                            label=f"🎵 Download {media_type.capitalize()} — {original_name}",
-                            data=media_bytes,
-                            file_name=original_name,
-                            mime=mime,
-                            key=f"dl_dump_media_{dump_id}"
-                        )
-                else:
-                    st.warning(f"⚠️ Attached {media_type} file not found on server.")
-
             st.caption(f"📞 From: {row.get('user_phone', 'Unknown')}")
+
+            has_primary       = bool(media_type and media_path)
+            extra_attachments = database_queries.get_attachments("dump", dump_id)
+            total_media       = (1 if has_primary else 0) + len(extra_attachments)
+
+            if total_media > 0:
+                with st.expander(f"📎 View {total_media} attachment(s)", expanded=False):
+                    if has_primary:
+                        st.caption("**Primary media:**")
+                        render_media_item(media_type, _abs(media_path), original_name, key=f"dump_primary_{dump_id}")
+                    if extra_attachments:
+                        st.caption(f"**Extra attachments ({len(extra_attachments)}):**")
+                        for i, att in enumerate(extra_attachments):
+                            render_media_item(
+                                att['media_type'], _abs(att['file_path']),
+                                att['original_name'] or f"attachment_{i+1}",
+                                key=f"dump_att_{dump_id}_{i}"
+                            )
 
             if st.button("🗑️ Delete", key=f"del_dump_{dump_id}"):
                 database_queries.delete_dump_by_id(dump_id)

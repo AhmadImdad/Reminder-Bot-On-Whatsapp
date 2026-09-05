@@ -90,6 +90,30 @@ def discard_expired_temp_media():
             logger.error(f"Failed to send discard notification to {user_phone}: {e}")
 
 
+def process_ready_media_batches():
+    """
+    Fires every 3 seconds. Finds batches whose 15-second window has closed
+    and triggers intent processing for each one.
+    Imported lazily to avoid circular imports.
+    """
+    try:
+        import message_handler
+        ready = database.get_ready_batches()
+        for row in ready:
+            batch_id   = row["batch_id"]
+            user_phone = row["user_phone"]
+            caption    = row["caption"] or ""
+            logger.info(f"Processing ready batch {batch_id} for {user_phone}")
+            # Mark immediately so parallel scheduler ticks don't double-process
+            database.mark_batch_processing(batch_id)
+            try:
+                message_handler.process_media_batch(batch_id, user_phone, caption)
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_id}: {e}")
+    except Exception as e:
+        logger.error(f"process_ready_media_batches error: {e}")
+
+
 def start_scheduler() -> BackgroundScheduler:
     """Initializes and starts the APScheduler."""
     scheduler = BackgroundScheduler()
@@ -99,6 +123,8 @@ def start_scheduler() -> BackgroundScheduler:
     scheduler.add_job(warn_expiring_temp_media, 'interval', minutes=5)
     # Check every 2 minutes for expired temp media to discard
     scheduler.add_job(discard_expired_temp_media, 'interval', minutes=2)
+    # Check every 3 seconds for media batches whose 15s window has closed
+    scheduler.add_job(process_ready_media_batches, 'interval', seconds=3)
     scheduler.start()
     logger.info("Reminder scheduler started.")
     return scheduler
