@@ -842,6 +842,23 @@ def get_attachments(section: str, entry_id: int, user_phone: str) -> List[sqlite
         return cursor.fetchall()
 
 
+def entry_exists(section: str, entry_id: int) -> bool:
+    """Returns True if a record with the given ID exists in the section table."""
+    table_map = {
+        "idea":     "ideas",
+        "note":     "notes",
+        "resource": "resources",
+        "dump":     "dumps",
+    }
+    table = table_map.get(section)
+    if not table:
+        return False
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT 1 FROM {table} WHERE id = ? LIMIT 1", (entry_id,))
+        return cursor.fetchone() is not None
+
+
 def delete_attachments_for_entry(section: str, entry_id: int, user_phone: str) -> int:
     """Deletes all attachments for a given entry. Returns count deleted."""
     with get_db_connection() as conn:

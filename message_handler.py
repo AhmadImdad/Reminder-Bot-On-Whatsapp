@@ -214,6 +214,8 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_awaiting_datetime_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_media_intent":
             handle_awaiting_media_intent_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_batch_subject":
+            handle_awaiting_batch_subject_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_section_confirmation":
             handle_awaiting_section_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_titan_response":
@@ -1176,19 +1178,31 @@ def process_media_batch(batch_id: str, user_phone: str, caption: str):
     )
 
 
+def _is_meaningful_subject(subject: str) -> bool:
+    """Returns True only if subject is a real human-provided title, not a fallback."""
+    s = (subject or "").strip()
+    if not s or len(s) < 3:
+        return False
+    if s.isdigit():                      # just a number like "3"
+        return False
+    if s.lower().startswith("media batch"):  # our auto-generated fallback
+        return False
+    return True
+
+
 def _execute_batch_intent(user_phone: str, intent_result: dict,
                           batch_id: str, rows: list) -> bool:
     """
     Executes an intent against an entire batch.
-    - attach_to_existing: all files added as attachments to the target entry
-    - new_*: first file becomes primary media, rest become attachments
+    - attach_to_existing: verifies entry exists first; if not, asks user to create new
+    - new_*: validates subject is meaningful; if not, asks user for a clear subject
     - discard: deletes everything
-    Returns True on success.
+    Returns True when the request is fully handled (saved OR state set for followup).
     """
     intent   = intent_result.get("intent", "unclear")
     section  = intent_result.get("section")
     entry_id = intent_result.get("entry_id")
-    subject  = intent_result.get("subject") or f"Media batch — {datetime.utcnow().strftime('%b %d, %Y')}"
+    subject  = (intent_result.get("subject") or "").strip()
     icon_map = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}
 
     if intent == "discard":
@@ -1202,9 +1216,24 @@ def _execute_batch_intent(user_phone: str, intent_result: dict,
 
     section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
     icon        = icon_map.get(section, "📎")
+    count       = len(rows)
 
     # ── Attach all files to an existing entry ─────────────────────────────────
     if intent == "attach_to_existing" and entry_id:
+        # GUARD: verify the entry actually exists
+        if not database.entry_exists(section, entry_id):
+            database.update_conversation_state(user_phone, "awaiting_batch_subject", {
+                "batch_id": batch_id,
+                "section":  section,
+            })
+            green_api_client.send_message(
+                user_phone,
+                f"⚠️ *{section.capitalize()} #{entry_id} doesn't exist.*\n\n"
+                f"Would you like to create a *new {section}* for these {count} file(s) instead?\n"
+                f"Reply with a clear *subject* for it, or *discard* to cancel."
+            )
+            return True  # handled — waiting for subject reply
+
         attached = 0
         for row in rows:
             new_path = _move_temp_to_section(row["file_path"], section_dir)
@@ -1222,12 +1251,25 @@ def _execute_batch_intent(user_phone: str, intent_result: dict,
         )
         return True
 
-    # ── Create new entry with all files ──────────────────────────────────────
+    # ── Create new entry with all files ───────────────────────────────────────
     if intent in ["new_idea", "new_note", "new_resource", "new_dump"]:
+        # GUARD: require a clear, meaningful subject
+        if not _is_meaningful_subject(subject):
+            database.update_conversation_state(user_phone, "awaiting_batch_subject", {
+                "batch_id": batch_id,
+                "section":  section,
+            })
+            green_api_client.send_message(
+                user_phone,
+                f"📝 What should be the *subject* for this new {section}?\n"
+                f"Please reply with a clear, meaningful title.\n"
+                f"(Or reply *discard* to cancel.)"
+            )
+            return True  # handled — waiting for subject reply
+
         first = rows[0]
         rest  = rows[1:]
 
-        # First file → primary media on the entry
         first_path = _move_temp_to_section(first["file_path"], section_dir)
         if not first_path:
             return False
@@ -1237,7 +1279,6 @@ def _execute_batch_intent(user_phone: str, intent_result: dict,
             first["media_type"], first_path, first["original_name"]
         )
 
-        # Remaining files → attachments
         for row in rest:
             new_path = _move_temp_to_section(row["file_path"], section_dir)
             if new_path:
@@ -1259,6 +1300,80 @@ def _execute_batch_intent(user_phone: str, intent_result: dict,
         return True
 
     return False
+
+
+def handle_awaiting_batch_subject_state(chat_id: str, message_data: Dict[str, Any],
+                                        message_type: str, context: Dict[str, Any]):
+    """
+    User replied with a subject for a new section entry (after bot asked for one).
+    Creates the entry and saves all batch files.
+    """
+    text     = extract_text_from_message(message_data, message_type).strip()
+    batch_id = context.get("batch_id")
+    section  = context.get("section")
+    icon_map = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}
+    icon     = icon_map.get(section, "📎")
+
+    if not batch_id or not section:
+        database.update_conversation_state(chat_id, "idle", {})
+        return
+
+    # Discard command
+    if text.lower() in ["discard", "cancel", "no", "nope"]:
+        _discard_batch(chat_id, batch_id)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "🗑️ Files discarded. Nothing was saved.")
+        return
+
+    subject = text.strip()
+    if not _is_meaningful_subject(subject):
+        green_api_client.send_message(
+            chat_id,
+            "That doesn't look like a clear subject. "
+            "Please reply with a proper title (e.g. 'Product launch photos')\n"
+            "Or reply *discard* to cancel."
+        )
+        return  # keep state, ask again
+
+    rows = database.get_batch_media(batch_id, chat_id)
+    if not rows:
+        green_api_client.send_message(chat_id, "⚠️ Your files seem to have been discarded already.")
+        database.update_conversation_state(chat_id, "idle", {})
+        return
+
+    section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+    first = rows[0]
+    rest  = rows[1:]
+
+    first_path = _move_temp_to_section(first["file_path"], section_dir)
+    if not first_path:
+        green_api_client.send_message(chat_id, "⚠️ Could not save the file. Please try again.")
+        database.update_conversation_state(chat_id, "idle", {})
+        return
+
+    entry_id_new = _save_new_section_entry(
+        chat_id, section, subject, None,
+        first["media_type"], first_path, first["original_name"]
+    )
+
+    for row in rest:
+        new_path = _move_temp_to_section(row["file_path"], section_dir)
+        if new_path:
+            database.add_attachment(
+                section, entry_id_new, chat_id,
+                row["media_type"], new_path, row["original_name"]
+            )
+
+    database.delete_batch_media(batch_id)
+    database.update_conversation_state(chat_id, "idle", {})
+
+    extra = f" + {len(rest)} more attachment(s)" if rest else ""
+    green_api_client.send_message(
+        chat_id,
+        f"{icon} *{section.capitalize()} #{entry_id_new} saved!*\n"
+        f"📌 *Subject:* {subject}\n"
+        f"📎 1 primary media{extra}"
+    )
 
 
 
