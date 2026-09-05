@@ -180,17 +180,24 @@ def extract_reminder_info(text: str, current_time: str) -> Optional[Dict[str, An
 def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
     """
     Determines if a message is an idea submission and extracts subject/description.
-    Returns {"is_idea": True, "subject": "...", "description": "..."} or {"is_idea": False} or None.
+    Returns {"is_idea": True, "subject": "...", "description": "...", "confidence": "high"|"medium"|"low"}
+    or {"is_idea": False} or None.
     """
     prompt = f"""
     You are an AI assistant for a WhatsApp bot's "Idea Store" feature.
 
-    The following message has already been identified as an idea submission.
-    Your ONLY job is to extract the subject and description perfectly.
+    The following message may be an idea submission.
+    Your job is to:
+    1. Confirm whether this is definitely an idea (is_idea: true/false)
+    2. Extract subject and description
+    3. Rate confidence of the classification
 
     EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
+    - description: All text between the first sentence and the last sentence. If nothing in between, return "".
+    - confidence: "high" if the message explicitly and clearly intends to save an idea.
+                  "medium" if it contains idea keywords but intent is slightly ambiguous.
+                  "low" if it barely qualifies or the word "idea" is incidental.
 
     Message:
     ---
@@ -200,9 +207,10 @@ def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_idea": true,
+        "is_idea": boolean,
         "subject": string,
-        "description": string
+        "description": string,
+        "confidence": string
     }}
     """
     raw = _gemini_json(prompt, max_tokens=256)
@@ -220,17 +228,18 @@ def classify_idea_intent(text: str) -> Optional[Dict[str, Any]]:
 def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
     """
     Determines if a message is a note submission and extracts subject/description.
-    Returns {"is_note": True, "subject": "...", "description": "..."} or {"is_note": False} or None.
+    Returns {"is_note": True, "subject": "...", "description": "...", "confidence": ...} or {"is_note": False} or None.
     """
     prompt = f"""
     You are an AI assistant for a WhatsApp bot's "Notes Store" feature.
 
-    The following message has already been identified as a note submission.
-    Your ONLY job is to extract the subject and description perfectly.
+    The following message may be a note submission.
+    Your job is to confirm, extract, and rate confidence.
 
     EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
+    - description: All text between the first and last sentence. If nothing in between, return "".
+    - confidence: "high" if clearly intended as a note. "medium" if ambiguous. "low" if barely qualifies.
 
     Message:
     ---
@@ -240,9 +249,10 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_note": true,
+        "is_note": boolean,
         "subject": string,
-        "description": string
+        "description": string,
+        "confidence": string
     }}
     """
     raw = _gemini_json(prompt, max_tokens=256)
@@ -258,16 +268,17 @@ def classify_note_intent(text: str) -> Optional[Dict[str, Any]]:
 # ── NLP: resource classification ─────────────────────────────────────────────
 
 def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
-    """Determines if a message is a resource submission and extracts subject/description."""
+    """Determines if a message is a resource submission and extracts subject/description with confidence."""
     prompt = f"""
     You are an AI assistant for a WhatsApp bot's "Resources Store" feature.
 
-    The following message has already been identified as a resource submission.
-    Your ONLY job is to extract the subject and description perfectly.
+    The following message may be a resource submission.
+    Your job is to confirm, extract, and rate confidence.
 
     EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
+    - description: All text between the first and last sentence. If nothing in between, return "".
+    - confidence: "high" if clearly a resource. "medium" if ambiguous. "low" if barely qualifies.
 
     Message:
     ---
@@ -277,9 +288,10 @@ def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_resource": true,
+        "is_resource": boolean,
         "subject": string,
-        "description": string
+        "description": string,
+        "confidence": string
     }}
     """
     raw = _gemini_json(prompt, max_tokens=256)
@@ -295,16 +307,17 @@ def classify_resource_intent(text: str) -> Optional[Dict[str, Any]]:
 # ── NLP: dump classification ──────────────────────────────────────────────────
 
 def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
-    """Determines if a message is a dump submission and extracts subject/description."""
+    """Determines if a message is a dump submission and extracts subject/description with confidence."""
     prompt = f"""
     You are an AI assistant for a WhatsApp bot's "Dump Store" feature.
 
-    The following message has already been identified as a dump submission.
-    Your ONLY job is to extract the subject and description perfectly.
+    The following message may be a dump submission.
+    Your job is to confirm, extract, and rate confidence.
 
     EXTRACTION RULES:
     - subject: The very first sentence of the message (trim whitespace).
-    - description: All text between the first sentence and the last sentence. If there is nothing between the first and last sentences, return an empty string "".
+    - description: All text between the first and last sentence. If nothing in between, return "".
+    - confidence: "high" if clearly intended as a dump. "medium" if ambiguous. "low" if barely qualifies.
 
     Message:
     ---
@@ -314,9 +327,10 @@ def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
     Respond ONLY with a valid JSON object. No extra text.
     Schema:
     {{
-        "is_dump": true,
+        "is_dump": boolean,
         "subject": string,
-        "description": string
+        "description": string,
+        "confidence": string
     }}
     """
     raw = _gemini_json(prompt, max_tokens=256)
@@ -326,4 +340,72 @@ def classify_dump_intent(text: str) -> Optional[Dict[str, Any]]:
         return json.loads(raw)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse dump intent JSON: {e}")
+        return None
+
+
+# ── NLP: media caption intent classification ──────────────────────────────────
+
+def classify_media_caption_intent(caption: str) -> Optional[Dict[str, Any]]:
+    """
+    Determines what a user wants to do with a media file based on the caption.
+
+    Returns:
+    {
+      "intent": "new_idea" | "new_note" | "new_resource" | "new_dump" |
+                "attach_to_existing" | "discard" | "unclear",
+      "section": "idea" | "note" | "resource" | "dump" | null,
+      "entry_id": int | null,
+      "subject": str | null,
+      "confidence": "high" | "medium" | "low"
+    }
+
+    Confidence rules:
+    - "high":   Caption explicitly names BOTH a section AND an action
+                (e.g. "save as idea", "attach to resource 3", "new note: meeting")
+    - "medium": Caption contains a section keyword but action is ambiguous
+    - "low":    No clear section or action detected
+    """
+    prompt = f"""
+You are an AI assistant for a WhatsApp personal assistant bot.
+
+The user has sent a media file (photo/video/document/audio) with the following caption:
+"{caption}"
+
+The bot has 4 storage sections: idea, note, resource, dump.
+
+Your job is to determine what the user wants to do with this media file.
+
+Respond ONLY with a valid JSON object matching this exact schema:
+{{
+    "intent": string (one of: "new_idea", "new_note", "new_resource", "new_dump", "attach_to_existing", "discard", "unclear"),
+    "section": string or null (one of: "idea", "note", "resource", "dump", or null if unclear),
+    "entry_id": integer or null (the ID number if user said "attach to resource 3", else null),
+    "subject": string or null (extracted title/subject if creating a new entry, else null),
+    "confidence": string (one of: "high", "medium", "low")
+}}
+
+Confidence rules:
+- "high": Caption EXPLICITLY mentions a section name AND either "new"/"save"/"create" OR a specific entry ID.
+  Examples: "save as idea", "attach to resource 3", "new note meeting summary", "add to dump 7"
+- "medium": Caption contains a section keyword but the action is ambiguous or vague.
+  Examples: "this is for my resources", "idea maybe?", "note stuff"
+- "low": Caption has NO clear section keyword or the intent is completely unclear.
+  Examples: "check this out", "fyi", "here", no caption at all
+
+Examples:
+- "save as idea" → intent: new_idea, section: idea, entry_id: null, confidence: high
+- "attach to resource 3" → intent: attach_to_existing, section: resource, entry_id: 3, confidence: high
+- "new note: meeting summary" → intent: new_note, section: note, subject: meeting summary, confidence: high
+- "add to dump 7" → intent: attach_to_existing, section: dump, entry_id: 7, confidence: high
+- "this might be an idea" → intent: new_idea, section: idea, confidence: medium
+- "cool photo" → intent: unclear, section: null, confidence: low
+- "discard" / "delete" / "cancel" → intent: discard, confidence: high
+"""
+    raw = _gemini_json(prompt, max_tokens=256)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse media caption intent JSON: {e}")
         return None

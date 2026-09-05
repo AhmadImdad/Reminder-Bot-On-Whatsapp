@@ -151,8 +151,37 @@ def init_db():
             )
         ''')
 
+        # Multi-media attachments — links extra files to any section entry
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attachments (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                section       TEXT NOT NULL,
+                entry_id      INTEGER NOT NULL,
+                user_phone    TEXT NOT NULL,
+                media_type    TEXT NOT NULL,
+                media_path    TEXT NOT NULL,
+                original_name TEXT,
+                created_at    DATETIME NOT NULL
+            )
+        ''')
+
+        # Temporary media staging — holds files while user decides where to save them
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS temp_media (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_phone    TEXT NOT NULL,
+                file_path     TEXT NOT NULL,
+                media_type    TEXT NOT NULL,
+                original_name TEXT,
+                saved_at      DATETIME NOT NULL,
+                warning_sent  INTEGER DEFAULT 0,
+                expires_at    DATETIME
+            )
+        ''')
+
         conn.commit()
     logger.info("Database initialized successfully.")
+
 
 def log_message(user_phone: str, message_type: str, message_content: str) -> int:
     """Logs an incoming user message and returns its ID."""
@@ -760,3 +789,155 @@ def verify_otp(otp: str) -> bool:
             return True
         return False
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ATTACHMENTS (multi-media per entry)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def add_attachment(section: str, entry_id: int, user_phone: str,
+                   media_type: str, media_path: str,
+                   original_name: Optional[str] = None) -> int:
+    """Links an extra media file to an existing section entry."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO attachments (section, entry_id, user_phone, media_type,
+                                     media_path, original_name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (section, entry_id, user_phone, media_type, media_path, original_name, now)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_attachments(section: str, entry_id: int, user_phone: str) -> List[sqlite3.Row]:
+    """Returns all extra attachments for a given section entry."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM attachments
+            WHERE section = ? AND entry_id = ? AND user_phone = ?
+            ORDER BY created_at ASC
+            """,
+            (section, entry_id, user_phone)
+        )
+        return cursor.fetchall()
+
+
+def delete_attachments_for_entry(section: str, entry_id: int, user_phone: str) -> int:
+    """Deletes all attachments for a given entry. Returns count deleted."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM attachments WHERE section = ? AND entry_id = ? AND user_phone = ?",
+            (section, entry_id, user_phone)
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEMP MEDIA (staging area for unassigned files)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def add_temp_media(user_phone: str, file_path: str,
+                   media_type: str, original_name: Optional[str] = None) -> int:
+    """Saves a new temp_media row and returns its ID."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO temp_media (user_phone, file_path, media_type, original_name,
+                                    saved_at, warning_sent, expires_at)
+            VALUES (?, ?, ?, ?, ?, 0, NULL)
+            """,
+            (user_phone, file_path, media_type, original_name, now)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_pending_temp_media(user_phone: str) -> Optional[sqlite3.Row]:
+    """Returns the most recent unsettled temp_media row for a user, or None."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM temp_media
+            WHERE user_phone = ? AND warning_sent = 0
+            ORDER BY saved_at DESC LIMIT 1
+            """,
+            (user_phone,)
+        )
+        return cursor.fetchone()
+
+
+def get_all_pending_temp_media(user_phone: str) -> List[sqlite3.Row]:
+    """Returns all unsettled temp_media rows for a user."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM temp_media WHERE user_phone = ? ORDER BY saved_at ASC",
+            (user_phone,)
+        )
+        return cursor.fetchall()
+
+
+def get_expiring_temp_media() -> List[sqlite3.Row]:
+    """Returns rows that are >60 min old and warning not yet sent."""
+    threshold = datetime.utcnow() - timedelta(minutes=60)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM temp_media WHERE saved_at <= ? AND warning_sent = 0",
+            (threshold,)
+        )
+        return cursor.fetchall()
+
+
+def get_expired_temp_media() -> List[sqlite3.Row]:
+    """Returns rows whose expires_at has passed (warning was sent, user didn't respond)."""
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM temp_media WHERE warning_sent = 1 AND expires_at IS NOT NULL AND expires_at <= ?",
+            (now,)
+        )
+        return cursor.fetchall()
+
+
+def mark_temp_media_warning_sent(row_id: int) -> None:
+    """Marks warning as sent and sets a 10-minute expiry window."""
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE temp_media SET warning_sent = 1, expires_at = ? WHERE id = ?",
+            (expires_at, row_id)
+        )
+        conn.commit()
+
+
+def delete_temp_media(row_id: int) -> None:
+    """Removes a temp_media row from the DB (caller must also delete the file)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM temp_media WHERE id = ?", (row_id,))
+        conn.commit()
+
+
+def get_temp_media_by_id(row_id: int, user_phone: str) -> Optional[sqlite3.Row]:
+    """Fetches a specific temp_media row scoped to a user."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM temp_media WHERE id = ? AND user_phone = ?",
+            (row_id, user_phone)
+        )
+        return cursor.fetchone()

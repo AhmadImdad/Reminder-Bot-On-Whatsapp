@@ -208,3 +208,47 @@ def process_dump_message(text: str) -> Optional[dict]:
     if not _last_sentence_contains_dump(text):
         return {"is_dump": False}
     return groq_client.classify_dump_intent(text)
+
+
+# ── Media caption intent (two-phase like section detectors) ───────────────────
+
+_MEDIA_KEYWORDS = re.compile(
+    r'\b(idea|note|resource|dump|attach|save|add to|link to|store|create|new|discard|delete|cancel)\b',
+    re.IGNORECASE
+)
+
+def process_media_caption(caption: str) -> dict:
+    """
+    Two-phase media caption intent detector.
+
+    Phase 1 — cheap Python regex: does the caption contain any media-routing keyword?
+               If not → return {"intent": "unclear", "confidence": "low"} immediately.
+    Phase 2 — LLM call for precise intent + confidence rating.
+
+    Returns:
+        {
+            "intent": "new_idea"|"new_note"|"new_resource"|"new_dump"|
+                      "attach_to_existing"|"discard"|"unclear",
+            "section": "idea"|"note"|"resource"|"dump"|null,
+            "entry_id": int|null,
+            "subject": str|null,
+            "confidence": "high"|"medium"|"low"
+        }
+    """
+    if not caption or not caption.strip():
+        return {"intent": "unclear", "section": None, "entry_id": None,
+                "subject": None, "confidence": "low"}
+
+    # Phase 1: fast pre-check
+    if not _MEDIA_KEYWORDS.search(caption):
+        return {"intent": "unclear", "section": None, "entry_id": None,
+                "subject": None, "confidence": "low"}
+
+    # Phase 2: LLM classification
+    result = groq_client.classify_media_caption_intent(caption)
+    if result is None:
+        logger.error("classify_media_caption_intent returned None — LLM failure.")
+        return {"intent": "unclear", "section": None, "entry_id": None,
+                "subject": None, "confidence": "low"}
+
+    return result

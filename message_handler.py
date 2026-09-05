@@ -9,11 +9,12 @@ import meta_api_client as green_api_client  # drop-in replacement for Green API
 import groq_client
 import config
 from nlp_parser import (
-    process_natural_language_reminder, 
-    process_idea_message, 
+    process_natural_language_reminder,
+    process_idea_message,
     process_note_message,
     process_resource_message,
-    process_dump_message
+    process_dump_message,
+    process_media_caption,
 )
 from utils import format_datetime_for_user, local_to_utc, utc_to_local
 
@@ -25,6 +26,15 @@ IDEA_MEDIA_DIR     = os.path.join(BASE_DIR, "ideas_media")
 NOTE_MEDIA_DIR     = os.path.join(BASE_DIR, "notes_media")
 RESOURCE_MEDIA_DIR = os.path.join(BASE_DIR, "resources_media")
 DUMP_MEDIA_DIR     = os.path.join(BASE_DIR, "dumps_media")
+TEMP_MEDIA_DIR     = os.path.join(BASE_DIR, "temp_media")
+
+# Mapping from section name → (media directory, DB save function)
+SECTION_META = {
+    "idea":     IDEA_MEDIA_DIR,
+    "note":     NOTE_MEDIA_DIR,
+    "resource": RESOURCE_MEDIA_DIR,
+    "dump":     DUMP_MEDIA_DIR,
+}
 
 
 def _resolve_media_path(media_path: str) -> str:
@@ -202,6 +212,15 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_datetime":
             handle_awaiting_datetime_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_media_intent":
+            handle_awaiting_media_intent_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_section_confirmation":
+            handle_awaiting_section_confirmation_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_titan_response":
+            # Handled by handle_commands at the top of the pipeline
+            if message_type == "text":
+                text = message_data.get("text", {}).get("body", "").strip()
+                handle_commands(chat_id, text)
 
     except Exception as e:
         logger.error(f"Error processing webhook: {e}", exc_info=True)
@@ -635,34 +654,67 @@ def format_reminders_table(reminders: list) -> str:
 
 def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: str):
     """Processes message when bot is idle (expecting a new command/reminder)."""
-    text = extract_text_from_message(message_data, message_type)
-    if not text:
-        # For audio messages without transcription or unsupported types
-        green_api_client.send_message(chat_id, "I couldn't understand that message. Please send text or a voice note.")
+
+    # ── MEDIA-ONLY / MEDIA+CAPTION MESSAGES ──────────────────────────────────
+    # If the message is a media type, we save the file immediately (URLs are short-lived)
+    # then route based on caption intent or ask the user what to do.
+    if message_type in _SUPPORTED_MEDIA_TYPES and message_type != "audio":
+        _handle_incoming_media(chat_id, message_data, message_type)
         return
 
-    # ── IDEA PRE-CHECK (runs before reminder/task pipeline) ───────────────────
-    # This is phase 1 of a two-phase detection. _last_sentence_contains_idea() is
-    # a cheap Python regex check. Only if it passes do we call the LLM.
+    # ── TEXT ONLY / AUDIO (transcribed) ──────────────────────────────────────
+    text = extract_text_from_message(message_data, message_type)
+    if not text:
+        green_api_client.send_message(
+            chat_id,
+            "I couldn't understand that message. Please send text or a voice note."
+        )
+        return
+
+    # ── IDEA PRE-CHECK ────────────────────────────────────────────────────────
     idea_result = process_idea_message(text)
     if idea_result is None:
-        # LLM call failed — notify user and bail safely
         green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
         return
     if idea_result.get("is_idea"):
-        handle_idea_capture(chat_id, idea_result, message_data, message_type)
-        return
-    # ── END IDEA PRE-CHECK ────────────────────────────────────────────────────
+        confidence = idea_result.get("confidence", "low")
+        if confidence == "high":
+            handle_idea_capture(chat_id, idea_result, message_data, message_type)
+            return
+        elif confidence == "medium":
+            subject = idea_result.get("subject", "your message")
+            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
+                "section": "idea", "subject": subject,
+                "description": idea_result.get("description", ""), "temp_media_id": None
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"💡 I think you want to save this as an *idea*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
+            )
+            return
+        # low confidence — fall through to reminder/task pipeline
 
-    # ── NOTE PRE-CHECK (runs after idea check, before reminder/task pipeline) ──
+    # ── NOTE PRE-CHECK ────────────────────────────────────────────────────────
     note_result = process_note_message(text)
     if note_result is None:
         green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
         return
     if note_result.get("is_note"):
-        handle_note_capture(chat_id, note_result, message_data, message_type)
-        return
-    # ── END NOTE PRE-CHECK ────────────────────────────────────────────────────
+        confidence = note_result.get("confidence", "low")
+        if confidence == "high":
+            handle_note_capture(chat_id, note_result, message_data, message_type)
+            return
+        elif confidence == "medium":
+            subject = note_result.get("subject", "your message")
+            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
+                "section": "note", "subject": subject,
+                "description": note_result.get("description", ""), "temp_media_id": None
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📓 I think you want to save this as a *note*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
+            )
+            return
 
     # ── RESOURCE PRE-CHECK ────────────────────────────────────────────────────
     resource_result = process_resource_message(text)
@@ -670,9 +722,21 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
         green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
         return
     if resource_result.get("is_resource"):
-        handle_resource_capture(chat_id, resource_result, message_data, message_type)
-        return
-    # ── END RESOURCE PRE-CHECK ────────────────────────────────────────────────
+        confidence = resource_result.get("confidence", "low")
+        if confidence == "high":
+            handle_resource_capture(chat_id, resource_result, message_data, message_type)
+            return
+        elif confidence == "medium":
+            subject = resource_result.get("subject", "your message")
+            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
+                "section": "resource", "subject": subject,
+                "description": resource_result.get("description", ""), "temp_media_id": None
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"🔗 I think you want to save this as a *resource*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
+            )
+            return
 
     # ── DUMP PRE-CHECK ────────────────────────────────────────────────────────
     dump_result = process_dump_message(text)
@@ -680,12 +744,25 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
         green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
         return
     if dump_result.get("is_dump"):
-        handle_dump_capture(chat_id, dump_result, message_data, message_type)
-        return
-    # ── END DUMP PRE-CHECK ────────────────────────────────────────────────────
+        confidence = dump_result.get("confidence", "low")
+        if confidence == "high":
+            handle_dump_capture(chat_id, dump_result, message_data, message_type)
+            return
+        elif confidence == "medium":
+            subject = dump_result.get("subject", "your message")
+            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
+                "section": "dump", "subject": subject,
+                "description": dump_result.get("description", ""), "temp_media_id": None
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"🗑️ I think you want to save this as a *dump*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
+            )
+            return
 
+    # ── REMINDER / TASK PIPELINE ──────────────────────────────────────────────
     extracted_actions = process_natural_language_reminder(text)
-    
+
     responses = []
     last_actions = []
     show_tasks_table = False
@@ -841,17 +918,296 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
         return
         
     extracted = extracted_actions[0]
-    
+
     if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
         dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
         final_task = extracted.get("task_description", task)
-        
+
         reminder_id = database.add_reminder(chat_id, final_task, dt)
         dt_str = format_datetime_for_user(dt)
         green_api_client.send_message(chat_id, f"✅ Reminder set: {final_task} on {dt_str}")
         database.update_conversation_state(chat_id, "idle", {"last_actions": [{"type": "reminder", "id": reminder_id}]})
     else:
         green_api_client.send_message(chat_id, "I still couldn't understand the correct time. Please try saying it clearly, like 'Tomorrow at 6 PM'")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMP MEDIA + MULTI-MEDIA ATTACHMENT HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_type: str):
+    """
+    Called when a media message (image/video/document/sticker) arrives in idle state.
+    1. Downloads and saves the file to temp_media/ immediately.
+    2. Checks caption for high-confidence intent → auto-route.
+    3. Otherwise asks the user what to do.
+    """
+    media_type, temp_path, original_name = _extract_and_save_media(
+        message_data, message_type, TEMP_MEDIA_DIR, "temp"
+    )
+
+    if not media_type or not temp_path:
+        green_api_client.send_message(
+            chat_id,
+            "⚠️ I couldn't download that file. Please try sending it again."
+        )
+        return
+
+    # Store in temp_media table
+    temp_id = database.add_temp_media(chat_id, temp_path, media_type, original_name)
+
+    # Check caption
+    caption = message_data.get(message_type, {}).get("caption", "").strip()
+
+    if caption:
+        result = process_media_caption(caption)
+        confidence = result.get("confidence", "low")
+
+        if confidence == "high":
+            # High confidence — act immediately
+            success = _execute_media_intent(chat_id, result, temp_id, temp_path, media_type, original_name)
+            if success:
+                return
+            # If execution failed, fall through to ask user
+
+    # Ask user what to do
+    pending_note = f"\n_File: {original_name}_" if original_name else ""
+    database.update_conversation_state(chat_id, "awaiting_media_intent", {"temp_id": temp_id})
+    green_api_client.send_message(
+        chat_id,
+        f"📎 *Got your {media_type}!*{pending_note}\n\n"
+        "What should I do with it? Reply with:\n"
+        "- *new idea* / *new note* / *new resource* / *new dump*\n"
+        "- *attach to idea 3* (or any section + ID)\n"
+        "- *discard* to delete it"
+    )
+
+
+def _execute_media_intent(chat_id: str, intent_result: dict,
+                          temp_id: int, temp_path: str,
+                          media_type: str, original_name: str) -> bool:
+    """
+    Executes a media routing intent (attach to existing or create new entry).
+    Moves the file from temp_media/ to the correct section folder.
+    Returns True on success, False on failure.
+    """
+    intent  = intent_result.get("intent", "unclear")
+    section = intent_result.get("section")
+    entry_id = intent_result.get("entry_id")
+    subject = intent_result.get("subject", original_name or "Media attachment")
+
+    if intent == "discard":
+        _discard_temp_media(chat_id, temp_id, temp_path)
+        green_api_client.send_message(chat_id, "🗑️ File discarded.")
+        return True
+
+    if intent == "unclear" or not section:
+        return False
+
+    # ── Attach to existing entry ──────────────────────────────────────────────
+    if intent == "attach_to_existing" and entry_id:
+        # Move file from temp_media → section folder
+        section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+        new_path = _move_temp_to_section(temp_path, section_dir)
+        if not new_path:
+            return False
+
+        database.add_attachment(section, entry_id, chat_id, media_type, new_path, original_name)
+        database.delete_temp_media(temp_id)
+        database.update_conversation_state(chat_id, "idle", {})
+
+        icon = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}.get(section, "📎")
+        green_api_client.send_message(
+            chat_id,
+            f"📎 {icon} Attachment added to *{section.capitalize()} #{entry_id}* successfully!"
+        )
+        return True
+
+    # ── Create new entry ──────────────────────────────────────────────────────
+    if intent in ["new_idea", "new_note", "new_resource", "new_dump"]:
+        section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+        new_path = _move_temp_to_section(temp_path, section_dir)
+        if not new_path:
+            return False
+
+        icon = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}.get(section, "📎")
+        entry_id_new = _save_new_section_entry(chat_id, section, subject, None, media_type, new_path, original_name)
+        database.delete_temp_media(temp_id)
+        database.update_conversation_state(chat_id, "idle", {})
+
+        green_api_client.send_message(
+            chat_id,
+            f"{icon} *{section.capitalize()} #{entry_id_new} saved!*\n"
+            f"📌 *Subject:* {subject}\n"
+            f"📎 (+ {media_type} attached)"
+        )
+        return True
+
+    return False
+
+
+def _move_temp_to_section(temp_path: str, section_dir: str) -> str:
+    """
+    Moves a file from temp_media to the target section directory.
+    Returns the new relative path, or empty string on error.
+    """
+    abs_temp = _resolve_media_path(temp_path)
+    if not os.path.exists(abs_temp):
+        logger.error(f"Temp file not found: {abs_temp}")
+        return ""
+
+    os.makedirs(section_dir, exist_ok=True)
+    filename = os.path.basename(abs_temp)
+    dest_abs = os.path.join(section_dir, filename)
+
+    try:
+        import shutil
+        shutil.move(abs_temp, dest_abs)
+        return os.path.relpath(dest_abs, BASE_DIR)
+    except Exception as e:
+        logger.error(f"Failed to move temp media {abs_temp} -> {dest_abs}: {e}")
+        return ""
+
+
+def _save_new_section_entry(chat_id: str, section: str, subject: str,
+                             description, media_type: str, media_path: str,
+                             original_name: str) -> int:
+    """Creates a new entry in the appropriate section table. Returns the new ID."""
+    if section == "idea":
+        return database.add_idea(chat_id, subject, description, media_type, media_path, original_name)
+    elif section == "note":
+        return database.add_note(chat_id, subject, description, media_type, media_path, original_name)
+    elif section == "resource":
+        return database.add_resource(chat_id, subject, description, media_type, media_path, original_name)
+    elif section == "dump":
+        return database.add_dump(chat_id, subject, description, media_type, media_path, original_name)
+    return 0
+
+
+def _discard_temp_media(chat_id: str, temp_id: int, temp_path: str):
+    """Deletes a temp media file and its DB row."""
+    abs_path = _resolve_media_path(temp_path)
+    try:
+        if os.path.exists(abs_path):
+            os.remove(abs_path)
+    except Exception as e:
+        logger.error(f"Failed to delete temp media file {abs_path}: {e}")
+    database.delete_temp_media(temp_id)
+
+
+def handle_awaiting_media_intent_state(chat_id: str, message_data: Dict[str, Any],
+                                        message_type: str, context: Dict[str, Any]):
+    """
+    User replied to the 'what should I do with your file?' prompt.
+    Parses their reply and routes the temp media accordingly.
+    """
+    text = extract_text_from_message(message_data, message_type).strip()
+    temp_id = context.get("temp_id")
+
+    if not temp_id:
+        database.update_conversation_state(chat_id, "idle", {})
+        return
+
+    temp_row = database.get_temp_media_by_id(temp_id, chat_id)
+    if not temp_row:
+        green_api_client.send_message(chat_id, "⚠️ Could not find your pending file. It may have already been discarded.")
+        database.update_conversation_state(chat_id, "idle", {})
+        return
+
+    temp_path    = temp_row["file_path"]
+    media_type   = temp_row["media_type"]
+    original_name = temp_row["original_name"] or ""
+
+    # Parse the user's reply
+    result = process_media_caption(text)
+    confidence = result.get("confidence", "low")
+
+    if confidence == "high":
+        success = _execute_media_intent(chat_id, result, temp_id, temp_path, media_type, original_name)
+        if success:
+            return
+        # Fall through to ask again
+
+    elif confidence == "medium":
+        section  = result.get("section", "unknown")
+        entry_id = result.get("entry_id")
+        if entry_id:
+            green_api_client.send_message(
+                chat_id,
+                f"I think you want to attach this to *{section} #{entry_id}*. Is that right? Reply *YES* or *NO*."
+            )
+        else:
+            green_api_client.send_message(
+                chat_id,
+                f"I think you want to save this as a new *{section}*. Is that right? Reply *YES* or *NO*."
+            )
+        # Keep state, store richer context
+        database.update_conversation_state(chat_id, "awaiting_media_intent", {
+            "temp_id": temp_id,
+            "pending_result": result
+        })
+        return
+
+    # Low confidence or unclear — give clear options again
+    green_api_client.send_message(
+        chat_id,
+        "I couldn't understand that. Please reply with:\n"
+        "- *new idea* / *new note* / *new resource* / *new dump*\n"
+        "- *attach to idea 3* (or any section + ID)\n"
+        "- *discard* to delete the file"
+    )
+
+
+def handle_awaiting_section_confirmation_state(chat_id: str, message_data: Dict[str, Any],
+                                                message_type: str, context: Dict[str, Any]):
+    """
+    Handles YES/NO response when bot had medium-confidence section detection.
+    """
+    text = extract_text_from_message(message_data, message_type).lower().strip()
+    section     = context.get("section", "")
+    subject     = context.get("subject", "")
+    description = context.get("description", "")
+    temp_id     = context.get("temp_media_id")
+
+    YES = ["yes", "y", "yeah", "yep", "correct", "sure", "ok", "okay"]
+    NO  = ["no", "n", "nope", "incorrect", "cancel", "wrong"]
+
+    if text in YES:
+        # Save the entry (no inline media since this came from a text message)
+        entry_id = _save_new_section_entry(chat_id, section, subject, description, None, None, None)
+        icon = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}.get(section, "📎")
+
+        # If there was a pending temp media, attach it now
+        if temp_id:
+            temp_row = database.get_temp_media_by_id(temp_id, chat_id)
+            if temp_row:
+                section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+                new_path = _move_temp_to_section(temp_row["file_path"], section_dir)
+                if new_path:
+                    database.add_attachment(section, entry_id, chat_id,
+                                            temp_row["media_type"], new_path,
+                                            temp_row["original_name"])
+                    database.delete_temp_media(temp_id)
+
+        green_api_client.send_message(
+            chat_id,
+            f"{icon} *{section.capitalize()} #{entry_id} saved!*\n📌 *Subject:* {subject}"
+            + (f"\n📝 *Description:* {description}" if description else "")
+        )
+        database.update_conversation_state(chat_id, "idle", {})
+
+    elif text in NO:
+        green_api_client.send_message(
+            chat_id,
+            "Got it — not saved. What would you like to do with this message?\n"
+            "Say 'new idea', 'new note', 'new resource', 'new dump', or just ignore it."
+        )
+        database.update_conversation_state(chat_id, "idle", {})
+
+    else:
+        green_api_client.send_message(chat_id, "Please reply *YES* or *NO*.")
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -903,7 +1259,7 @@ def handle_idea_capture(chat_id: str, idea_result: dict,
 
 
 def handle_idea_show(chat_id: str, idea_id: int):
-    """Retrieves and sends a single idea back to the user, including any media."""
+    """Retrieves and sends a single idea back to the user, including any media and extra attachments."""
     idea = database.get_idea_by_id(idea_id, chat_id)
 
     if not idea:
@@ -922,7 +1278,7 @@ def handle_idea_show(chat_id: str, idea_id: int):
         reply += f"\n📝 *Description:* {description}"
     green_api_client.send_message(chat_id, reply)
 
-    # Send media as a follow-up message if it exists
+    # Send primary media
     if media_type and media_path:
         abs_path = _resolve_media_path(media_path)
         if os.path.exists(abs_path):
@@ -930,10 +1286,18 @@ def handle_idea_show(chat_id: str, idea_id: int):
                 green_api_client.send_file(chat_id, abs_path, media_original_name)
             except Exception as e:
                 logger.error(f"Failed to send idea media for idea #{idea_id}: {e}")
-                green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
-        else:
-            # File was recorded in DB but no longer on disk
-            green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
+
+    # Send extra attachments
+    attachments = database.get_attachments("idea", idea_id, chat_id)
+    for att in attachments:
+        abs_path = _resolve_media_path(att["media_path"])
+        if os.path.exists(abs_path):
+            try:
+                green_api_client.send_file(chat_id, abs_path, att["original_name"] or "attachment")
+            except Exception as e:
+                logger.error(f"Failed to send attachment for idea #{idea_id}: {e}")
+    if attachments:
+        green_api_client.send_message(chat_id, f"📎 {len(attachments)} extra attachment(s) shown above.")
 
 
 def format_ideas_table(ideas: list) -> str:
@@ -1019,7 +1383,7 @@ def handle_note_capture(chat_id: str, note_result: dict,
 
 
 def handle_note_show(chat_id: str, note_id: int):
-    """Retrieves and sends a single note back to the user, including any media."""
+    """Retrieves and sends a single note back to the user, including media and attachments."""
     note = database.get_note_by_id(note_id, chat_id)
 
     if not note:
@@ -1044,9 +1408,17 @@ def handle_note_show(chat_id: str, note_id: int):
                 green_api_client.send_file(chat_id, abs_path, media_original_name)
             except Exception as e:
                 logger.error(f"Failed to send note media for note #{note_id}: {e}")
-                green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
-        else:
-            green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
+
+    attachments = database.get_attachments("note", note_id, chat_id)
+    for att in attachments:
+        abs_path = _resolve_media_path(att["media_path"])
+        if os.path.exists(abs_path):
+            try:
+                green_api_client.send_file(chat_id, abs_path, att["original_name"] or "attachment")
+            except Exception as e:
+                logger.error(f"Failed to send attachment for note #{note_id}: {e}")
+    if attachments:
+        green_api_client.send_message(chat_id, f"📎 {len(attachments)} extra attachment(s) shown above.")
 
 
 def format_notes_table(notes: list) -> str:
@@ -1119,6 +1491,14 @@ def handle_resource_show(chat_id: str, r_id: int):
         if os.path.exists(abs_path):
             try: green_api_client.send_file(chat_id, abs_path, item['media_original_name'] or "attachment")
             except: pass
+    attachments = database.get_attachments("resource", r_id, chat_id)
+    for att in attachments:
+        abs_path = _resolve_media_path(att["media_path"])
+        if os.path.exists(abs_path):
+            try: green_api_client.send_file(chat_id, abs_path, att["original_name"] or "attachment")
+            except: pass
+    if attachments:
+        green_api_client.send_message(chat_id, f"📎 {len(attachments)} extra attachment(s) shown above.")
 
 def format_resources_table(items: list) -> str:
     if not items: return "Your resource store is empty."
@@ -1170,6 +1550,14 @@ def handle_dump_show(chat_id: str, d_id: int):
         if os.path.exists(abs_path):
             try: green_api_client.send_file(chat_id, abs_path, item['media_original_name'] or "attachment")
             except: pass
+    attachments = database.get_attachments("dump", d_id, chat_id)
+    for att in attachments:
+        abs_path = _resolve_media_path(att["media_path"])
+        if os.path.exists(abs_path):
+            try: green_api_client.send_file(chat_id, abs_path, att["original_name"] or "attachment")
+            except: pass
+    if attachments:
+        green_api_client.send_message(chat_id, f"📎 {len(attachments)} extra attachment(s) shown above.")
 
 def format_dumps_table(items: list) -> str:
     if not items: return "Your dump store is empty."
