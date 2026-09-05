@@ -3,7 +3,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 
 import database
-import green_api_client
+import meta_api_client as green_api_client  # drop-in replacement for Green API
 
 logger = logging.getLogger(__name__)
 

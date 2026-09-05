@@ -2,7 +2,9 @@ import sqlite3
 from typing import List, Dict, Any, Optional
 import json
 import logging
-from datetime import datetime
+import random
+import string
+from datetime import datetime, timedelta
 
 import config
 
@@ -122,6 +124,30 @@ def init_db():
                 media_path TEXT,
                 media_original_name TEXT,
                 created_at DATETIME NOT NULL
+            )
+        ''')
+
+        conn.commit()
+
+        # Allowed users table — admin-managed whitelist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS allowed_users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone       TEXT NOT NULL UNIQUE,
+                label       TEXT,
+                is_admin    INTEGER DEFAULT 0,
+                added_at    DATETIME NOT NULL
+            )
+        ''')
+
+        # OTP tokens table — for forgot-password flow
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS otp_tokens (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                otp        TEXT NOT NULL,
+                created_at DATETIME NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used       INTEGER DEFAULT 0
             )
         ''')
 
@@ -550,3 +576,187 @@ def delete_dump(dump_id: int, user_phone: str) -> bool:
         )
         conn.commit()
         return cursor.rowcount > 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ALLOWED USERS (Multi-user access control)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def seed_admin_phone() -> None:
+    """
+    Ensures the admin phone number from config is always present in allowed_users.
+    Called once at startup. Safe to call multiple times (uses INSERT OR IGNORE).
+    """
+    admin_phone = config.ALLOWED_PHONE_NUMBER
+    if not admin_phone:
+        return
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO allowed_users (phone, label, is_admin, added_at)
+            VALUES (?, ?, 1, ?)
+            """,
+            (admin_phone, "Admin", datetime.utcnow())
+        )
+        conn.commit()
+    logger.info(f"Admin phone seeded: {admin_phone}")
+
+
+def is_phone_allowed(phone: str) -> bool:
+    """Returns True if the given phone number is in the allowed_users table."""
+    phone_clean = phone.split("@")[0]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM allowed_users WHERE phone = ?",
+            (phone_clean,)
+        )
+        return cursor.fetchone() is not None
+
+
+def get_allowed_phones() -> List[str]:
+    """Returns a list of all allowed phone number strings."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone FROM allowed_users ORDER BY added_at ASC")
+        return [row["phone"] for row in cursor.fetchall()]
+
+
+def get_all_allowed_users() -> List[sqlite3.Row]:
+    """Returns all rows from allowed_users for the admin UI."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM allowed_users ORDER BY is_admin DESC, added_at ASC")
+        return cursor.fetchall()
+
+
+def add_allowed_user(phone: str, label: str = "") -> bool:
+    """Adds a new allowed user. Returns True if inserted, False if already exists."""
+    phone_clean = phone.strip()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO allowed_users (phone, label, is_admin, added_at)
+                VALUES (?, ?, 0, ?)
+                """,
+                (phone_clean, label.strip(), datetime.utcnow())
+            )
+            conn.commit()
+            return True
+    except sqlite3.IntegrityError:
+        # UNIQUE constraint — user already exists
+        return False
+
+
+def remove_allowed_user(phone: str) -> bool:
+    """
+    Removes an allowed user and CASCADES deletion of ALL their data:
+    reminders, tasks, notes, ideas, resources, dumps, messages, conversation_state.
+    Admin phone (is_admin=1) cannot be removed.
+    Returns True if a user was removed.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Safety: never remove the admin
+        cursor.execute(
+            "SELECT is_admin FROM allowed_users WHERE phone = ?",
+            (phone,)
+        )
+        row = cursor.fetchone()
+        if not row or row["is_admin"] == 1:
+            logger.warning(f"Attempted to remove admin or non-existent user: {phone}")
+            return False
+
+        # Cascade delete all user data
+        tables = [
+            "reminders", "tasks", "notes", "ideas",
+            "resources", "dumps", "messages", "conversation_state"
+        ]
+        for table in tables:
+            col = "user_phone" if table != "conversation_state" else "user_phone"
+            cursor.execute(f"DELETE FROM {table} WHERE {col} = ?", (phone,))
+
+        # Remove from allowed list
+        cursor.execute("DELETE FROM allowed_users WHERE phone = ?", (phone,))
+        conn.commit()
+        logger.info(f"User {phone} and all associated data removed.")
+        return True
+
+
+def is_admin_phone(phone: str) -> bool:
+    """Returns True if the given phone is the admin."""
+    phone_clean = phone.split("@")[0]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT is_admin FROM allowed_users WHERE phone = ?",
+            (phone_clean,)
+        )
+        row = cursor.fetchone()
+        return bool(row and row["is_admin"] == 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OTP TOKENS (Forgot-password flow)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_otp(length: int = 6) -> str:
+    """Generates a cryptographically random numeric OTP."""
+    return "".join(random.choices(string.digits, k=length))
+
+
+def create_otp() -> str:
+    """
+    Generates a new 6-digit OTP, stores it in the DB with a 10-minute expiry,
+    invalidates any previous unused OTPs, and returns the OTP string.
+    """
+    otp = generate_otp()
+    now = datetime.utcnow()
+    expires_at = now + timedelta(minutes=10)
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # Invalidate previous OTPs
+        cursor.execute("UPDATE otp_tokens SET used = 1 WHERE used = 0")
+        # Insert new OTP
+        cursor.execute(
+            """
+            INSERT INTO otp_tokens (otp, created_at, expires_at, used)
+            VALUES (?, ?, ?, 0)
+            """,
+            (otp, now, expires_at)
+        )
+        conn.commit()
+    return otp
+
+
+def verify_otp(otp: str) -> bool:
+    """
+    Verifies an OTP: must exist, be unused, and not expired.
+    Marks it as used on success.
+    Returns True if valid.
+    """
+    now = datetime.utcnow()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id FROM otp_tokens
+            WHERE otp = ? AND used = 0 AND expires_at > ?
+            """,
+            (otp, now)
+        )
+        row = cursor.fetchone()
+        if row:
+            cursor.execute(
+                "UPDATE otp_tokens SET used = 1 WHERE id = ?",
+                (row["id"],)
+            )
+            conn.commit()
+            return True
+        return False
+

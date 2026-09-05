@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict, Any
 
 import database
-import green_api_client
+import meta_api_client as green_api_client  # drop-in replacement for Green API
 import groq_client
 import config
 from nlp_parser import (
@@ -17,14 +17,30 @@ from nlp_parser import (
 )
 from utils import format_datetime_for_user, local_to_utc, utc_to_local
 
-# Directory where idea media files are stored locally
-IDEA_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ideas_media")
-# Directory where note media files are stored locally
-NOTE_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes_media")
-# Directory where resource media files are stored locally
-RESOURCE_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources_media")
-# Directory where dump media files are stored locally
-DUMP_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dumps_media")
+# Absolute path to the project root — used to compute relative media paths.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Media directories (absolute, for saving files to disk)
+IDEA_MEDIA_DIR     = os.path.join(BASE_DIR, "ideas_media")
+NOTE_MEDIA_DIR     = os.path.join(BASE_DIR, "notes_media")
+RESOURCE_MEDIA_DIR = os.path.join(BASE_DIR, "resources_media")
+DUMP_MEDIA_DIR     = os.path.join(BASE_DIR, "dumps_media")
+
+
+def _resolve_media_path(media_path: str) -> str:
+    """
+    Resolve a media path from the database to an absolute path on the current machine.
+
+    New entries store RELATIVE paths (e.g. 'ideas_media/abc.jpg').
+    Legacy entries may still have absolute paths — they are returned unchanged
+    so old data keeps working until you run the migration script.
+    """
+    if not media_path:
+        return media_path
+    if os.path.isabs(media_path):
+        # Legacy absolute path — return as-is for backwards compatibility
+        return media_path
+    return os.path.join(BASE_DIR, media_path)
 
 logger = logging.getLogger(__name__)
 
@@ -33,22 +49,15 @@ logger = logging.getLogger(__name__)
 # UNIVERSAL MEDIA EXTRACTION & DOWNLOAD HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Meta Cloud API message-type mapping ──────────────────────────────────────
+# Maps the Meta 'type' field from the messages array to our internal type names.
 _SUPPORTED_MEDIA_TYPES = {
-    "imageMessage":    "image",
-    "audioMessage":    "audio",
-    "pttMessage":      "audio",
-    "videoMessage":    "video",
-    "documentMessage": "document",
+    "image":    "image",
+    "audio":    "audio",
+    "video":    "video",
+    "document": "document",
+    "sticker":  "image",
 }
-
-# All possible Green API data keys where downloadUrl might live
-_MEDIA_DATA_KEYS = [
-    "fileMessageData",
-    "imageMessageData",
-    "videoMessageData",
-    "audioMessageData",
-    "documentMessageData",
-]
 
 
 def _extract_and_save_media(
@@ -60,10 +69,12 @@ def _extract_and_save_media(
     """
     Universal media extractor for all Second Brain sections (Ideas, Notes, Resources, Dumps).
 
+    Meta Cloud API provides a ``media_id`` (not a direct URL).  This function:
     1. Checks if message_type is a supported media type.
-    2. Searches ALL possible Green API data keys for a downloadUrl.
-    3. Downloads the file and returns (media_type, saved_path, original_name).
-    4. Returns (None, None, None) if the message has no media or download fails.
+    2. Pulls the media_id from the Meta message payload.
+    3. Calls meta_api_client.download_file(media_id, path) which resolves
+       the media_id to a signed URL and downloads the file.
+    4. Returns (media_type, saved_path, original_name) or (None, None, None).
     """
     if message_type not in _SUPPORTED_MEDIA_TYPES:
         logger.debug(f"[{section_name}] message_type '{message_type}' is not a media type — skipping media save.")
@@ -71,109 +82,136 @@ def _extract_and_save_media(
 
     media_type = _SUPPORTED_MEDIA_TYPES[message_type]
 
-    # Search ALL possible data keys for a downloadUrl
-    download_url = ""
-    original_name = ""
-    source_key = ""
+    # Meta puts the media object directly under the message type key.
+    # e.g. for type="image": message_data["image"] = {"id": "...", "mime_type": "...", ...}
+    media_obj = message_data.get(message_type, {})
+    media_id = media_obj.get("id", "")
+    original_name = media_obj.get("filename", "")  # only present for documents
 
-    for key in _MEDIA_DATA_KEYS:
-        data_block = message_data.get(key)
-        if data_block and isinstance(data_block, dict):
-            url_candidate = data_block.get("downloadUrl", "")
-            if url_candidate:
-                download_url = url_candidate
-                original_name = data_block.get("fileName", "")
-                source_key = key
-                logger.info(f"[{section_name}] Found downloadUrl in '{key}'")
-                break
-
-    if not download_url:
-        # Log ALL available keys so we can debug what Green API actually sent
-        available_keys = [k for k in message_data.keys()]
-        logger.warning(
-            f"[{section_name}] No downloadUrl found in any data key. "
-            f"message_type={message_type}, available_keys={available_keys}"
+    if not media_id:
+        logger.error(
+            f"[{section_name}] No media_id found for message_type={message_type}. "
+            f"Available keys: {list(message_data.keys())}"
         )
-        # Last-ditch: try to find downloadUrl anywhere in message_data (nested search)
-        for key, value in message_data.items():
-            if isinstance(value, dict) and "downloadUrl" in value:
-                download_url = value["downloadUrl"]
-                original_name = value.get("fileName", "")
-                source_key = key
-                logger.info(f"[{section_name}] Found downloadUrl via deep scan in '{key}'")
-                break
-
-    if not download_url:
-        logger.error(f"[{section_name}] Giving up: no downloadUrl found anywhere in message_data.")
         return None, None, None
 
-    # Fallback original name
-    if not original_name:
-        original_name = f"{media_type}_{uuid.uuid4()}"
-
-    # Determine extension safely
+    # Determine file extension
+    mime_type = media_obj.get("mime_type", "")
     ext_map = {"image": "jpg", "audio": "ogg", "video": "mp4", "document": "pdf"}
-    orig_ext = os.path.splitext(original_name)[1].lstrip(".")
-    ext = orig_ext if orig_ext else ext_map.get(media_type, "bin")
+    # Try to get extension from mime_type (e.g. 'image/jpeg' → 'jpeg')
+    mime_ext = mime_type.split("/")[-1].replace("jpeg", "jpg") if mime_type else ""
+    ext = mime_ext if mime_ext else ext_map.get(media_type, "bin")
 
     # Generate a safe, collision-proof filename
+    if not original_name:
+        original_name = f"{media_type}_{uuid.uuid4()}.{ext}"
     safe_name = f"{uuid.uuid4().hex}.{ext}"
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, safe_name)
 
-    logger.info(f"[{section_name}] Downloading {media_type} from {source_key} -> {save_path}")
+    logger.info(f"[{section_name}] Downloading {media_type} via media_id={media_id} -> {save_path}")
 
-    if green_api_client.download_file(download_url, save_path):
+    if green_api_client.download_file(media_id, save_path):
         logger.info(f"[{section_name}] Media saved successfully to {save_path}")
-        return media_type, save_path, original_name
+        # Store a RELATIVE path in the DB so it works on any machine/server
+        relative_path = os.path.relpath(save_path, BASE_DIR)
+        return media_type, relative_path, original_name
     else:
-        logger.error(f"[{section_name}] download_file() FAILED for url={download_url[:80]}...")
+        logger.error(f"[{section_name}] download_file() FAILED for media_id={media_id}")
         return None, None, None
 
-def handle_incoming_webhook(data: Dict[str, Any]):
-    """Main entry point for Green API webhooks."""
+def _parse_meta_webhook(data: Dict[str, Any]):
+    """
+    Extract the first message from a Meta Cloud API webhook payload.
+
+    Meta's webhook JSON structure:
+    {
+      "object": "whatsapp_business_account",
+      "entry": [{
+        "changes": [{
+          "value": {
+            "messages": [{ "from": "923...", "type": "text", "text": {"body": "..."} }],
+            "contacts": [...]
+          }
+        }]
+      }]
+    }
+
+    Returns:
+        (chat_id, message_type, message_data) or (None, None, None) if not a
+        valid incoming user message.
+    """
+    if data.get("object") != "whatsapp_business_account":
+        return None, None, None
+
     try:
-        # Check if it's an incoming message
-        if data.get("typeWebhook") != "incomingMessageReceived":
+        value = data["entry"][0]["changes"][0]["value"]
+    except (KeyError, IndexError):
+        return None, None, None
+
+    messages = value.get("messages")
+    if not messages:
+        # This is a status update (delivered/read), not an incoming message
+        return None, None, None
+
+    msg = messages[0]
+    message_type = msg.get("type", "")
+
+    # Build a unified message_data dict that contains both the top-level msg
+    # fields AND the type-specific sub-object (so _extract_and_save_media
+    # and extract_text_from_message can find everything in one place).
+    message_data = dict(msg)  # shallow copy; includes 'type', 'from', 'id', etc.
+
+    # phone number — Meta gives plain E.164 without any suffix
+    chat_id = msg.get("from", "")
+
+    return chat_id, message_type, message_data
+
+
+def handle_incoming_webhook(data: Dict[str, Any]):
+    """Main entry point for Meta WhatsApp Cloud API webhooks."""
+    try:
+        chat_id, message_type, message_data = _parse_meta_webhook(data)
+
+        if not chat_id or not message_type:
+            return  # status update or unsupported payload — ignore silently
+
+        # Ignore group messages (group chat_ids from Meta contain '-')
+        if "-" in chat_id:
+            logger.debug(f"Ignoring group message from {chat_id}")
             return
 
-        message_data = data.get("messageData", {})
-        sender_data = data.get("senderData", {})
-        
-        chat_id = sender_data.get("sender", "")
-        if not chat_id or "@c.us" not in chat_id:
-            # Ignore group messages or malformed sender IDs
-            return
-            
-        # Access control restriction
-        if config.ALLOWED_PHONE_NUMBER and not chat_id.startswith(config.ALLOWED_PHONE_NUMBER):
+        # Access control restriction — check against DB-managed allowed_users list
+        if not database.is_phone_allowed(chat_id):
             logger.warning(f"Ignored message from unauthorized number: {chat_id}")
             return
-            
-        message_type = message_data.get("typeMessage")
-        
+
         # Handle simple commands first (list, cancel, help)
-        if message_type == "textMessage":
-            text = message_data.get("textMessageData", {}).get("textMessage", "").strip()
+        if message_type == "text":
+            text = message_data.get("text", {}).get("body", "").strip()
             if handle_commands(chat_id, text):
                 return
-                
+
         # Handle state machine for conversational flow
         state_data = database.get_conversation_state(chat_id)
         current_state = state_data["state"]
-        
+
         if current_state == "idle":
             handle_idle_state(chat_id, message_data, message_type)
         elif current_state == "awaiting_confirmation":
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_datetime":
             handle_awaiting_datetime_state(chat_id, message_data, message_type, state_data["context"])
-            
+
     except Exception as e:
         logger.error(f"Error processing webhook: {e}", exc_info=True)
         # Attempt to notify the user
         try:
-            chat_id = data.get("senderData", {}).get("sender", "")
+            chat_id = data.get("entry", [{}])[0] \
+                          .get("changes", [{}])[0] \
+                          .get("value", {}) \
+                          .get("messages", [{}])[0] \
+                          .get("from", "")
             if chat_id:
                 green_api_client.send_message(chat_id, "Sorry, I encountered an internal error while processing your request.")
         except:
@@ -181,8 +219,29 @@ def handle_incoming_webhook(data: Dict[str, Any]):
 
 def handle_commands(chat_id: str, text: str) -> bool:
     """Handles basic text commands. Returns True if a command was executed."""
-    text_lower = text.lower()
-    
+    text_lower = text.lower().strip()
+
+    # ── TITAN / OTP RESPONSE (Forgot-password flow) ───────────────────────────
+    # Check if this user is in awaiting_titan_response state (admin only)
+    state_data = database.get_conversation_state(chat_id)
+    if state_data.get("state") == "awaiting_titan_response" and database.is_admin_phone(chat_id):
+        if text_lower == "titan":
+            otp = database.create_otp()
+            green_api_client.send_message(
+                chat_id,
+                f"🔐 *Password Reset OTP:* `{otp}`\n\n"
+                f"This code is valid for *10 minutes* only.\n"
+                f"Enter it on the dashboard to reset your password."
+            )
+            database.update_conversation_state(chat_id, "idle", {})
+        else:
+            green_api_client.send_message(
+                chat_id,
+                "❌ Incorrect answer. Password reset cancelled."
+            )
+            database.update_conversation_state(chat_id, "idle", {})
+        return True
+
     if text_lower in ["help", "/help"]:
         help_text = (
             "🤖 **Reminder Bot Help**\n\n"
@@ -436,43 +495,42 @@ def handle_commands(chat_id: str, text: str) -> bool:
     return False
 
 def extract_text_from_message(message_data: Dict[str, Any], message_type: str) -> str:
-    """Extracts text from textMessage, extendedTextMessage, media captions, or transcribes audioMessage."""
-    if message_type == "textMessage":
-        return message_data.get("textMessageData", {}).get("textMessage", "")
-        
-    elif message_type == "extendedTextMessage":
-        return message_data.get("extendedTextMessageData", {}).get("text", "")
-        
-    elif message_type in ["imageMessage", "videoMessage", "documentMessage"]:
-        caption = message_data.get("fileMessageData", {}).get("caption", "")
-        if not caption:
-            caption = message_data.get("imageMessageData", {}).get("caption", "")
-        if not caption:
-            caption = message_data.get("videoMessageData", {}).get("caption", "")
-        return caption
-        
-    elif message_type in ["audioMessage", "pttMessage"]:
-        file_url = message_data.get("fileMessageData", {}).get("downloadUrl", "")
-        if not file_url:
+    """
+    Extracts text from a Meta Cloud API message payload.
+
+    Meta field layout by type:
+      text     → message_data["text"]["body"]
+      image    → message_data["image"]["caption"]  (optional)
+      video    → message_data["video"]["caption"]  (optional)
+      document → message_data["document"]["caption"] (optional)
+      audio    → message_data["audio"]["id"]  (media_id — download & transcribe)
+    """
+    if message_type == "text":
+        return message_data.get("text", {}).get("body", "")
+
+    elif message_type in ["image", "video", "document", "sticker"]:
+        # Return the caption if the user typed one alongside the media
+        return message_data.get(message_type, {}).get("caption", "")
+
+    elif message_type == "audio":
+        # Meta audio messages — download via media_id then transcribe
+        media_id = message_data.get("audio", {}).get("id", "")
+        if not media_id:
             return ""
-            
-        # Download temp file
+
         import tempfile
-        import uuid
-        
+
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(temp_dir, f"audio_{uuid.uuid4()}.ogg")
-        
+
         try:
-            if green_api_client.download_file(file_url, file_path):
-                # Transcribe
+            if green_api_client.download_file(media_id, file_path):
                 transcription = groq_client.transcribe_audio(file_path)
                 return transcription or ""
         finally:
-            # Cleanup
             if os.path.exists(file_path):
                 os.remove(file_path)
-                
+
     return ""
 
 def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
@@ -524,6 +582,19 @@ def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
         table += f"+---+{dash_col}+----------------+------+\n"
     
     table += "```"
+
+    # ── Pending summary line ──────────────────────────────────────────────────
+    # Collect the list IDs (1-based display index) of all pending tasks
+    pending_ids = [
+        str(i + 1)
+        for i, t in enumerate(tasks)
+        if t['status'] == 'pending'
+    ]
+    if pending_ids:
+        count = len(pending_ids)
+        ids_str = ", ".join(f"#{pid}" for pid in pending_ids)
+        table += f"\n⏳ *{count} pending task(s):* {ids_str}"
+
     return table
 
 def format_reminders_table(reminders: list) -> str:
@@ -566,6 +637,7 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
     """Processes message when bot is idle (expecting a new command/reminder)."""
     text = extract_text_from_message(message_data, message_type)
     if not text:
+        # For audio messages without transcription or unsupported types
         green_api_client.send_message(chat_id, "I couldn't understand that message. Please send text or a voice note.")
         return
 
@@ -851,15 +923,17 @@ def handle_idea_show(chat_id: str, idea_id: int):
     green_api_client.send_message(chat_id, reply)
 
     # Send media as a follow-up message if it exists
-    if media_type and media_path and os.path.exists(media_path):
-        try:
-            green_api_client.send_file(chat_id, media_path, media_original_name)
-        except Exception as e:
-            logger.error(f"Failed to send idea media for idea #{idea_id}: {e}")
-            green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
-    elif media_type and media_path:
-        # File was recorded in DB but no longer on disk
-        green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
+    if media_type and media_path:
+        abs_path = _resolve_media_path(media_path)
+        if os.path.exists(abs_path):
+            try:
+                green_api_client.send_file(chat_id, abs_path, media_original_name)
+            except Exception as e:
+                logger.error(f"Failed to send idea media for idea #{idea_id}: {e}")
+                green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
+        else:
+            # File was recorded in DB but no longer on disk
+            green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
 
 
 def format_ideas_table(ideas: list) -> str:
@@ -963,14 +1037,16 @@ def handle_note_show(chat_id: str, note_id: int):
         reply += f"\n📝 *Description:* {description}"
     green_api_client.send_message(chat_id, reply)
 
-    if media_type and media_path and os.path.exists(media_path):
-        try:
-            green_api_client.send_file(chat_id, media_path, media_original_name)
-        except Exception as e:
-            logger.error(f"Failed to send note media for note #{note_id}: {e}")
-            green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
-    elif media_type and media_path:
-        green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
+    if media_type and media_path:
+        abs_path = _resolve_media_path(media_path)
+        if os.path.exists(abs_path):
+            try:
+                green_api_client.send_file(chat_id, abs_path, media_original_name)
+            except Exception as e:
+                logger.error(f"Failed to send note media for note #{note_id}: {e}")
+                green_api_client.send_message(chat_id, "⚠️ There was an error sending the attached media.")
+        else:
+            green_api_client.send_message(chat_id, f"⚠️ The attached {media_type} file could not be found on the server.")
 
 
 def format_notes_table(notes: list) -> str:
@@ -1038,9 +1114,11 @@ def handle_resource_show(chat_id: str, r_id: int):
     reply = f"🔗 *Resource #{r_id}*\n📌 *Subject:* {item['subject']}"
     if item['description']: reply += f"\n📝 *Description:* {item['description']}"
     green_api_client.send_message(chat_id, reply)
-    if item['media_type'] and item['media_path'] and os.path.exists(item['media_path']):
-        try: green_api_client.send_file(chat_id, item['media_path'], item['media_original_name'] or "attachment")
-        except: pass
+    if item['media_type'] and item['media_path']:
+        abs_path = _resolve_media_path(item['media_path'])
+        if os.path.exists(abs_path):
+            try: green_api_client.send_file(chat_id, abs_path, item['media_original_name'] or "attachment")
+            except: pass
 
 def format_resources_table(items: list) -> str:
     if not items: return "Your resource store is empty."
@@ -1087,9 +1165,11 @@ def handle_dump_show(chat_id: str, d_id: int):
     reply = f"🗑️ *Dump #{d_id}*\n📌 *Subject:* {item['subject']}"
     if item['description']: reply += f"\n📝 *Description:* {item['description']}"
     green_api_client.send_message(chat_id, reply)
-    if item['media_type'] and item['media_path'] and os.path.exists(item['media_path']):
-        try: green_api_client.send_file(chat_id, item['media_path'], item['media_original_name'] or "attachment")
-        except: pass
+    if item['media_type'] and item['media_path']:
+        abs_path = _resolve_media_path(item['media_path'])
+        if os.path.exists(abs_path):
+            try: green_api_client.send_file(chat_id, abs_path, item['media_original_name'] or "attachment")
+            except: pass
 
 def format_dumps_table(items: list) -> str:
     if not items: return "Your dump store is empty."

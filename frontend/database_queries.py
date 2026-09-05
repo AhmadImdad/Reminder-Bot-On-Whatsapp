@@ -370,3 +370,72 @@ def get_dump_stats() -> dict:
         cursor.execute("SELECT COUNT(*) FROM dumps WHERE media_type IS NOT NULL")
         with_media = cursor.fetchone()[0]
     return {"total": total, "with_media": with_media}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# USER MANAGEMENT (allowed_users table)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_all_allowed_users() -> pd.DataFrame:
+    """Returns all allowed users as a DataFrame for the admin UI."""
+    with get_db_connection() as conn:
+        try:
+            df = pd.read_sql_query(
+                "SELECT id, phone, label, is_admin, added_at FROM allowed_users ORDER BY is_admin DESC, added_at ASC",
+                conn
+            )
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["id", "phone", "label", "is_admin", "added_at"])
+
+
+def add_allowed_user(phone: str, label: str = "") -> tuple[bool, str]:
+    """
+    Inserts a new allowed user into the DB.
+    Returns (success: bool, message: str).
+    """
+    phone_clean = phone.strip()
+    if not phone_clean.isdigit():
+        return False, "Phone number must contain digits only (e.g. 923001234567)."
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO allowed_users (phone, label, is_admin, added_at)
+                VALUES (?, ?, 0, ?)
+                """,
+                (phone_clean, label.strip(), datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            return True, f"User {phone_clean} added successfully."
+        except sqlite3.IntegrityError:
+            return False, f"Phone {phone_clean} is already in the allowed list."
+
+
+def remove_allowed_user(phone: str) -> tuple[bool, str]:
+    """
+    Removes an allowed user and all their data from every table.
+    Admin (is_admin=1) cannot be removed.
+    Returns (success: bool, message: str).
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT is_admin FROM allowed_users WHERE phone = ?", (phone,))
+        row = cursor.fetchone()
+        if not row:
+            return False, f"User {phone} not found."
+        if row["is_admin"] == 1:
+            return False, "The admin user cannot be removed."
+
+        # Cascade delete all user data
+        tables = ["reminders", "tasks", "notes", "ideas",
+                  "resources", "dumps", "messages", "conversation_state"]
+        for table in tables:
+            cursor.execute(f"DELETE FROM {table} WHERE user_phone = ?", (phone,))
+
+        cursor.execute("DELETE FROM allowed_users WHERE phone = ?", (phone,))
+        conn.commit()
+        return True, f"User {phone} and all their data have been deleted."
+
