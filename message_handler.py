@@ -625,7 +625,9 @@ def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
             return "🗒️ No completed tasks yet."
         return f"You have no {filter_status} tasks."
 
-    N = max([len(t['task_name']) for t in filtered] + [9])
+    MAX_NAME = 24
+    name_lens = [min(len(t['task_name']), MAX_NAME) for t in filtered]
+    N = max(name_lens + [9])
     dash_col = "-" * (N + 2)
     header_col = " Task Name".ljust(N + 2)
 
@@ -635,7 +637,9 @@ def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
 
     for i, t in enumerate(filtered):
         list_id  = tasks.index(t) + 1  # display index is position in original full list
-        name     = t['task_name'].ljust(N)
+        raw_name = t['task_name']
+        display_name = (raw_name[:MAX_NAME - 2] + "..") if len(raw_name) > MAX_NAME else raw_name
+        name     = display_name.ljust(N)
 
         end_time = "None"
         if t['end_datetime']:
@@ -670,7 +674,9 @@ def format_reminders_table(reminders: list) -> str:
     if not reminders:
         return "You have no pending reminders."
     
-    N = max([len(r['task']) for r in reminders] + [8])
+    MAX_REM = 24
+    name_lens = [min(len(r['task']), MAX_REM) for r in reminders]
+    N = max(name_lens + [8])
     dash_col = "-" * (N + 2)
     header_col = " Reminder".ljust(N + 2)
     
@@ -680,7 +686,9 @@ def format_reminders_table(reminders: list) -> str:
     
     for r in reminders:
         list_id = r['id']
-        name = r['task'].ljust(N)
+        raw_name = r['task']
+        display_name = (raw_name[:MAX_REM - 2] + "..") if len(raw_name) > MAX_REM else raw_name
+        name = display_name.ljust(N)
         
         dt_str = "None"
         if r['reminder_datetime']:

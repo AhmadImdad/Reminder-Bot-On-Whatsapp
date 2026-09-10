@@ -36,18 +36,42 @@ def _auth_headers() -> dict:
 # Send text message
 # ---------------------------------------------------------------------------
 
-def send_message(chat_id: str, message: str) -> bool:
-    """
-    Send a plain-text WhatsApp message via Meta Cloud API.
+def _split_message(text: str, max_length: int = 4000) -> list:
+    """Splits a long message into chunks under max_length, preferring newline boundaries."""
+    if len(text) <= max_length:
+        return [text]
 
-    Args:
-        chat_id: Recipient phone number, either as '923066008613' or
-                 '923066008613@c.us' (the @c.us suffix is stripped automatically).
-        message: The text body to send.
+    chunks = []
+    lines = text.split("\n")
+    current_chunk = []
+    current_length = 0
 
-    Returns:
-        True on success, False after all retries are exhausted.
-    """
+    for line in lines:
+        line_len = len(line) + 1  # include newline
+        if current_length + line_len > max_length:
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            # If a single line itself is longer than max_length, hard-split it
+            while len(line) > max_length:
+                chunks.append(line[:max_length])
+                line = line[max_length:]
+            if line:
+                current_chunk.append(line)
+                current_length = len(line) + 1
+        else:
+            current_chunk.append(line)
+            current_length += line_len
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    return chunks
+
+
+def _send_single_message(chat_id: str, message: str) -> bool:
+    """Sends a single message chunk (<= 4096 characters) via Meta Cloud API."""
     phone = _phone(chat_id)
     url = _graph_url(f"{config.META_PHONE_NUMBER_ID}/messages")
     payload = {
@@ -75,6 +99,35 @@ def send_message(chat_id: str, message: str) -> bool:
                 time.sleep(2 ** attempt)  # Exponential back-off
 
     return False
+
+
+def send_message(chat_id: str, message: str) -> bool:
+    """
+    Send a plain-text WhatsApp message via Meta Cloud API.
+    Automatically chunks messages exceeding WhatsApp's 4096 character limit.
+
+    Args:
+        chat_id: Recipient phone number, either as '923066008613' or
+                 '923066008613@c.us' (the @c.us suffix is stripped automatically).
+        message: The text body to send.
+
+    Returns:
+        True on success, False after all retries are exhausted.
+    """
+    if not message:
+        return True
+
+    # If message exceeds WhatsApp's limit, split into parts
+    if len(message) > 4000:
+        chunks = _split_message(message, max_length=4000)
+        all_ok = True
+        for chunk in chunks:
+            if not _send_single_message(chat_id, chunk):
+                all_ok = False
+            time.sleep(0.3)
+        return all_ok
+
+    return _send_single_message(chat_id, message)
 
 
 # ---------------------------------------------------------------------------
