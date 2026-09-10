@@ -185,7 +185,17 @@ def handle_incoming_webhook(data: Dict[str, Any]):
         chat_id, message_type, message_data = _parse_meta_webhook(data)
 
         if not chat_id or not message_type:
+            # Check if this was a delivery/read status receipt from Meta
+            try:
+                statuses = data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("statuses", [])
+                if statuses:
+                    s = statuses[0]
+                    logger.info(f"Webhook status update: status='{s.get('status')}' recipient={s.get('recipient_id')}")
+            except Exception:
+                pass
             return  # status update or unsupported payload — ignore silently
+
+        logger.info(f"Received message from {chat_id} (type={message_type})")
 
         # Ignore group messages (group chat_ids from Meta contain '-')
         if "-" in chat_id:
@@ -200,6 +210,7 @@ def handle_incoming_webhook(data: Dict[str, Any]):
         # Handle simple commands first (list, cancel, help)
         if message_type == "text":
             text = message_data.get("text", {}).get("body", "").strip()
+            logger.info(f"Message text from {chat_id}: '{text}'")
             if handle_commands(chat_id, text):
                 return
 
