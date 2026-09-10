@@ -213,14 +213,17 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_datetime":
             handle_awaiting_datetime_state(chat_id, message_data, message_type, state_data["context"])
-        # ── NEW guided-save states ──────────────────────────────────────────────
+        # ── Guided-save states ─────────────────────────────────────────────────────
         elif current_state == "awaiting_save_destination":
             handle_awaiting_save_destination_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_subject":
             handle_awaiting_subject_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_attach_target":
             handle_awaiting_attach_target_state(chat_id, message_data, message_type, state_data["context"])
-        # ── Legacy states (kept for reminders / confirmation) ────────────────────
+        # ── Multi-action selection state ──────────────────────────────────────────
+        elif current_state == "awaiting_action_selection":
+            handle_awaiting_action_selection_state(chat_id, message_data, message_type, state_data["context"])
+        # ── Legacy states ────────────────────────────────────────────────────────
         elif current_state == "awaiting_section_confirmation":
             handle_awaiting_section_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_titan_response":
@@ -502,17 +505,52 @@ def handle_commands(chat_id: str, text: str) -> bool:
         database.update_conversation_state(chat_id, "idle", {})
         return True
 
+    # ── TASK COMMANDS (show tasks / pending / completed) ─────────────────────
+    elif text_lower in ["tasks", "my tasks", "show tasks", "list tasks"]:
+        tasks = database.get_user_tasks(chat_id)
+        green_api_client.send_message(chat_id, format_tasks_table(tasks, filter_status="all"))
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
+    elif text_lower in ["pending tasks", "show pending tasks", "my pending tasks", "list pending tasks"]:
+        tasks = database.get_user_tasks(chat_id)
+        msg = format_tasks_table(tasks, filter_status="pending")
+        if tasks and not any(t['status'] == 'pending' for t in tasks):
+            msg = "✅ No pending tasks — you're all caught up!"
+        green_api_client.send_message(chat_id, msg)
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
+    elif text_lower in ["completed tasks", "show completed tasks", "done tasks", "finished tasks", "list completed tasks"]:
+        tasks = database.get_user_tasks(chat_id)
+        msg = format_tasks_table(tasks, filter_status="completed")
+        if tasks and not any(t['status'] == 'completed' for t in tasks):
+            msg = "🗓️ No completed tasks yet."
+        green_api_client.send_message(chat_id, msg)
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
+    # ── REMINDERS (extra aliases) ────────────────────────────────────────────
+    elif text_lower in ["my reminders", "reminders", "list reminders", "show reminders", "list"]:
+        reminders = database.get_user_pending_reminders(chat_id)
+        if not reminders:
+            green_api_client.send_message(chat_id, "You have no pending reminders.")
+        else:
+            green_api_client.send_message(chat_id, format_reminders_table(reminders))
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
     # ── DIRECTORY COMMANDS ─────────────────────────────────────────────────────
     elif text_lower in ["show sections", "show me all the sections", "show all sections", "sections", "menu"]:
         sections_msg = (
             "🗂️ *Reminder-Bot Sections Directory*\n\n"
             "⏰ *Reminders:* `my reminders`\n"
-            "📝 *Tasks:* `my tasks`\n"
+            "📝 *Tasks:* `my tasks`  |  `pending tasks`  |  `completed tasks`\n"
             "💡 *Ideas:* `my ideas`\n"
             "📓 *Notes:* `my notes`\n"
             "🔗 *Resources:* `my resources`\n"
             "🗑️ *Dumps:* `my dumps`\n\n"
-            "_Send a message ending with the section name (e.g., 'this is an idea') to save into it._"
+            "_Send any message or media to save it into a section of your choice._"
         )
         green_api_client.send_message(chat_id, sections_msg)
         database.update_conversation_state(chat_id, "idle", {})
@@ -560,35 +598,34 @@ def extract_text_from_message(message_data: Dict[str, Any], message_type: str) -
     return ""
 
 def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
-    """Formats a list of tasks into an ASCII table optimized for mobile. Optionally filters by status."""
+    """Formats a list of tasks into an ASCII table. Optionally filters by status."""
     if not tasks:
-        return "You have no active tasks."
-    
-    # Check if there are any tasks matching the filter
-    has_matches = False
-    for t in tasks:
-        if filter_status == "all" or t['status'] == filter_status:
-            has_matches = True
-            break
-            
-    if not has_matches:
+        if filter_status == "pending":
+            return "✅ No pending tasks — you're all caught up!"
+        elif filter_status == "completed":
+            return "🗒️ No completed tasks yet."
+        return "You have no tasks yet."
+
+    filtered = [t for t in tasks if filter_status == "all" or t['status'] == filter_status]
+    if not filtered:
+        if filter_status == "pending":
+            return "✅ No pending tasks — you're all caught up!"
+        elif filter_status == "completed":
+            return "🗒️ No completed tasks yet."
         return f"You have no {filter_status} tasks."
-    
-    N = max([len(t['task_name']) for t in tasks] + [9])
+
+    N = max([len(t['task_name']) for t in filtered] + [9])
     dash_col = "-" * (N + 2)
     header_col = " Task Name".ljust(N + 2)
-    
+
     table = f"```text\n+---+{dash_col}+----------------+------+\n"
     table += f"|ID |{header_col}| End Time       |Status|\n"
     table += f"+---+{dash_col}+----------------+------+\n"
-    
-    for i, t in enumerate(tasks):
-        if filter_status != "all" and t['status'] != filter_status:
-            continue
-            
-        list_id = i + 1
-        name = t['task_name'].ljust(N)
-        
+
+    for i, t in enumerate(filtered):
+        list_id  = tasks.index(t) + 1  # display index is position in original full list
+        name     = t['task_name'].ljust(N)
+
         end_time = "None"
         if t['end_datetime']:
             try:
@@ -600,26 +637,20 @@ def format_tasks_table(tasks: list, filter_status: str = "all") -> str:
             except Exception as e:
                 logger.error(f"Task Date Error: {e}")
         end_time = end_time[:14].ljust(14)
-        
+
         status = "Pend" if t['status'] == 'pending' else "Done"
         status = status.ljust(6)
-        
+
         table += f"|{str(list_id).ljust(3)}| {name} | {end_time} |{status}|\n"
         table += f"+---+{dash_col}+----------------+------+\n"
-    
+
     table += "```"
 
-    # ── Pending summary line ──────────────────────────────────────────────────
-    # Collect the list IDs (1-based display index) of all pending tasks
-    pending_ids = [
-        str(i + 1)
-        for i, t in enumerate(tasks)
-        if t['status'] == 'pending'
-    ]
-    if pending_ids:
-        count = len(pending_ids)
+    # Pending summary line
+    pending_ids = [str(tasks.index(t) + 1) for t in tasks if t['status'] == 'pending']
+    if pending_ids and filter_status == "all":
         ids_str = ", ".join(f"#{pid}" for pid in pending_ids)
-        table += f"\n⏳ *{count} pending task(s):* {ids_str}"
+        table += f"\n⏳ *{len(pending_ids)} pending task(s):* {ids_str}"
 
     return table
 
@@ -662,14 +693,17 @@ def format_reminders_table(reminders: list) -> str:
 def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: str):
     """Processes message when bot is idle.
     Media  → batch accumulation (15-second window, guided menu when ready).
-    Text   → reminder/task pipeline first; anything unrecognised → guided save offer.
+    Text   → commands first → then reminder/task NLP.
+             Single action: execute immediately with confirmation.
+             Multiple actions: list them and ask user to choose which ones.
+             Unrecognised: guided save offer.
     """
-    # ── MEDIA ─────────────────────────────────────────────────────────────────
+    # ── MEDIA ────────────────────────────────────────────────────────────
     if message_type in _SUPPORTED_MEDIA_TYPES:
         _handle_incoming_media(chat_id, message_data, message_type)
         return
 
-    # ── TEXT / AUDIO ──────────────────────────────────────────────────────────
+    # ── TEXT / AUDIO ────────────────────────────────────────────────────────────
     text = extract_text_from_message(message_data, message_type)
     if not text:
         green_api_client.send_message(
@@ -677,149 +711,290 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
         )
         return
 
-    # ── REMINDER / TASK PIPELINE ──────────────────────────────────────────────
+    # ── REMINDER / TASK NLP PIPELINE ────────────────────────────────────────
     extracted_actions = process_natural_language_reminder(text)
 
-    responses = []
+    # Filter only valid (non-none) actions with real intents
+    _list_intents   = {"list_tasks", "list_pending_tasks", "list_completed_tasks", "list_reminders"}
+    _modify_intents = {"remove_task", "complete_task", "add_task", "add_reminder"}
+    valid_actions   = [a for a in extracted_actions if a.get("intent", "none") != "none"]
+
+    if not valid_actions:
+        # Nothing the NLP understood — offer the guided save flow
+        _offer_text_save(chat_id, text)
+        return
+
+    # Separate display actions (list_*) from mutating actions
+    display_actions = [a for a in valid_actions if a.get("intent") in _list_intents]
+    mutate_actions  = [a for a in valid_actions if a.get("intent") in _modify_intents]
+
+    # Handle display actions immediately (they're read-only, always fine)
+    for action in display_actions:
+        _execute_pipeline_action(chat_id, action)
+
+    if not mutate_actions:
+        # Only display actions — done
+        return
+
+    # ── Single mutating action → execute directly ────────────────────────────
+    if len(mutate_actions) == 1:
+        _execute_pipeline_action(chat_id, mutate_actions[0])
+        return
+
+    # ── Multiple mutating actions → ask user to choose ────────────────────────
+    numbered = _format_action_list(mutate_actions)
+    database.update_conversation_state(chat_id, "awaiting_action_selection", {
+        "pending_actions": [dict(a) for a in mutate_actions]
+    })
+    green_api_client.send_message(
+        chat_id,
+        f"📨 I received your message and it contains *{len(mutate_actions)} requests*:\n\n"
+        f"{numbered}\n\n"
+        f"Reply with the *number(s)* of the ones you want to execute — "
+        f"e.g. *1*, *2*, *1 2*, or *all*.\n"
+        f"Reply *cancel* to ignore all of them."
+    )
+
+
+def _format_action_list(actions: list) -> str:
+    """Returns a numbered list of actions for display to user."""
+    _intent_labels = {
+        "add_reminder": "⏰ Set reminder",
+        "add_task":     "📝 Add task",
+        "remove_task":  "❌ Remove task",
+        "complete_task":"✅ Complete task",
+    }
+    lines = []
+    for i, action in enumerate(actions, 1):
+        intent = action.get("intent", "unknown")
+        label  = _intent_labels.get(intent, intent)
+        desc   = action.get("task_description", action.get("task", ""))
+        dt_str = ""
+        if action.get("parsed_datetime_utc"):
+            try:
+                dt = datetime.fromisoformat(action["parsed_datetime_utc"])
+                dt_str = f" — {format_datetime_for_user(dt)}"
+            except Exception:
+                pass
+        lines.append(f"*{i}.* {label}: \"{desc}\"{dt_str}")
+    return "\n".join(lines)
+
+
+def _execute_pipeline_action(chat_id: str, action: dict) -> list:
+    """
+    Executes a single NLP-extracted action (add_reminder, add_task, list_*, etc.).
+    Returns a list of last_action dicts for undo tracking.
+    Sends confirmation message directly to the user.
+    """
+    intent = action.get("intent", "none")
     last_actions = []
-    show_tasks_table     = False
-    task_filter_status   = "all"
-    show_reminders_table = False
-    handled_by_pipeline  = False
 
-    for extracted in extracted_actions:
-        intent = extracted.get("intent", "none")
+    if intent == "list_tasks":
+        tasks = database.get_user_tasks(chat_id)
+        green_api_client.send_message(chat_id, format_tasks_table(tasks, filter_status="all"))
 
-        if intent == "none":
-            continue   # fall through to guided-save offer
+    elif intent == "list_pending_tasks":
+        tasks = database.get_user_tasks(chat_id)
+        green_api_client.send_message(chat_id, format_tasks_table(tasks, filter_status="pending"))
 
-        handled_by_pipeline = True
+    elif intent == "list_completed_tasks":
+        tasks = database.get_user_tasks(chat_id)
+        green_api_client.send_message(chat_id, format_tasks_table(tasks, filter_status="completed"))
 
-        if intent == "list_tasks":
-            show_tasks_table = True; task_filter_status = "all"
-        elif intent == "list_pending_tasks":
-            show_tasks_table = True; task_filter_status = "pending"
-        elif intent == "list_completed_tasks":
-            show_tasks_table = True; task_filter_status = "completed"
-        elif intent == "list_reminders":
-            show_reminders_table = True
-        elif intent == "remove_task":
-            list_id_to_remove = extracted.get("target_list_id")
-            if list_id_to_remove is None:
-                responses.append("Please specify which task number you want to remove.")
+    elif intent == "list_reminders":
+        reminders = database.get_user_pending_reminders(chat_id)
+        green_api_client.send_message(chat_id, format_reminders_table(reminders))
+
+    elif intent == "remove_task":
+        list_id = action.get("target_list_id")
+        if list_id is None:
+            green_api_client.send_message(chat_id, "Please specify which task number you want to remove.")
+        else:
+            success = database.delete_task_by_offset(chat_id, list_id - 1)
+            if success:
+                tasks = database.get_user_tasks(chat_id)
+                green_api_client.send_message(
+                    chat_id,
+                    f"✅ *Task #{list_id} removed.*\n\n" + format_tasks_table(tasks, filter_status="all")
+                )
             else:
-                success = database.delete_task_by_offset(chat_id, list_id_to_remove - 1)
-                responses.append("✅ Task removed." if success else f"❌ Could not find active task number {list_id_to_remove}.")
-                if success:
-                    show_tasks_table = True
-        elif intent == "complete_task":
-            list_id_to_complete = extracted.get("target_list_id")
-            if list_id_to_complete is None:
-                responses.append("Please specify which task number you want to complete.")
+                green_api_client.send_message(chat_id, f"❌ Could not find active task number {list_id}.")
+
+    elif intent == "complete_task":
+        list_id = action.get("target_list_id")
+        if list_id is None:
+            green_api_client.send_message(chat_id, "Please specify which task number you want to complete.")
+        else:
+            success = database.mark_task_completed_by_offset(chat_id, list_id - 1)
+            if success:
+                tasks = database.get_user_tasks(chat_id)
+                green_api_client.send_message(
+                    chat_id,
+                    f"✅ *Task #{list_id} marked as completed!*\n\n" + format_tasks_table(tasks, filter_status="all")
+                )
             else:
-                success = database.mark_task_completed_by_offset(chat_id, list_id_to_complete - 1)
-                responses.append("✅ Task completed!" if success else f"❌ Could not find active task number {list_id_to_complete}.")
-                if success:
-                    show_tasks_table = True
-        elif intent == "add_task":
-            task_desc = extracted.get("task_description", "")
-            if not task_desc:
-                responses.append("Please tell me what the task is.")
-                continue
+                green_api_client.send_message(chat_id, f"❌ Could not find active task number {list_id}.")
+
+    elif intent == "add_task":
+        task_desc = action.get("task_description", "")
+        if not task_desc:
+            green_api_client.send_message(chat_id, "Please tell me what the task is.")
+        else:
             dt = None
-            if extracted.get("parsed_datetime_utc"):
-                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+            if action.get("parsed_datetime_utc"):
+                try:
+                    dt = datetime.fromisoformat(action["parsed_datetime_utc"])
+                except Exception:
+                    pass
             task_id = database.add_task(chat_id, task_desc, dt)
             last_actions.append({"type": "task", "id": task_id})
-            responses.append("✅ Task added successfully!")
-            show_tasks_table = True
-        elif intent == "add_reminder":
-            task = extracted.get("task_description", "")
-            confidence = extracted.get("confidence", "low")
-            if confidence == "high" and extracted.get("parsed_datetime_utc"):
-                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-                reminder_id = database.add_reminder(chat_id, task, dt)
-                last_actions.append({"type": "reminder", "id": reminder_id})
-                responses.append(f"✅ Reminder set: {task} on {format_datetime_for_user(dt)}")
-            elif confidence == "medium" and extracted.get("parsed_datetime_utc"):
-                dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-                responses.append(f"I understood: {task} on {format_datetime_for_user(dt)}. Is this correct? Reply YES or NO.")
-                database.update_conversation_state(chat_id, "awaiting_confirmation", {
-                    "task": task, "parsed_datetime_utc": extracted["parsed_datetime_utc"]
-                })
-                break
-            else:
-                error_msg = extracted.get("error", "")
-                if error_msg == "The specified time is in the past.":
-                    responses.append(f"You asked to be reminded about: {task}. But the time seems to be in the past. When should I remind you?")
-                else:
-                    responses.append(f"I want to remind you about: {task}. When should I remind you? Please provide date and time.")
-                database.update_conversation_state(chat_id, "awaiting_datetime", {"task": task})
-                break
+            dt_line = f"\n📅 *Deadline:* {format_datetime_for_user(dt)}" if dt else ""
+            tasks = database.get_user_tasks(chat_id)
+            green_api_client.send_message(
+                chat_id,
+                f"✅ *Task saved!*\n"
+                f"📝 *{task_desc}*{dt_line}\n\n"
+                + format_tasks_table(tasks, filter_status="all")
+            )
 
-    final_msg = "\n".join(responses)
-    if show_tasks_table:
-        tasks = database.get_user_tasks(chat_id)
-        final_msg += ("\n\n" if final_msg else "") + format_tasks_table(tasks, filter_status=task_filter_status)
-    if show_reminders_table:
-        reminders = database.get_user_pending_reminders(chat_id)
-        final_msg += ("\n\n" if final_msg else "") + format_reminders_table(reminders)
-    if final_msg:
-        green_api_client.send_message(chat_id, final_msg)
+    elif intent == "add_reminder":
+        task       = action.get("task_description", "")
+        confidence = action.get("confidence", "low")
+
+        if confidence == "high" and action.get("parsed_datetime_utc"):
+            dt = datetime.fromisoformat(action["parsed_datetime_utc"])
+            reminder_id = database.add_reminder(chat_id, task, dt)
+            last_actions.append({"type": "reminder", "id": reminder_id})
+            green_api_client.send_message(
+                chat_id,
+                f"✅ *Reminder set!*\n"
+                f"⏰ *{task}*\n"
+                f"📅 *{format_datetime_for_user(dt)}*"
+            )
+        elif confidence == "medium" and action.get("parsed_datetime_utc"):
+            dt = datetime.fromisoformat(action["parsed_datetime_utc"])
+            database.update_conversation_state(chat_id, "awaiting_confirmation", {
+                "task": task, "parsed_datetime_utc": action["parsed_datetime_utc"]
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"💡 I understood:\n"
+                f"⏰ *{task}*\n"
+                f"📅 *{format_datetime_for_user(dt)}*\n\n"
+                f"Is this correct? Reply *YES* or *NO*."
+            )
+        else:
+            error_msg = action.get("error", "")
+            if error_msg == "The specified time is in the past.":
+                prompt = f"You asked to be reminded about: *{task}*. But the time seems to be in the past. When should I remind you?"
+            else:
+                prompt = f"I want to remind you about: *{task}*. When should I remind you? Please provide date and time."
+            database.update_conversation_state(chat_id, "awaiting_datetime", {"task": task})
+            green_api_client.send_message(chat_id, prompt)
+
     if last_actions:
         database.update_conversation_state(chat_id, "idle", {"last_actions": last_actions})
 
-    # ── GUIDED SAVE OFFER for unrecognised text ───────────────────────────────
-    if not handled_by_pipeline:
-        _offer_text_save(chat_id, text)
+    return last_actions
+
+
+def handle_awaiting_action_selection_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """
+    User is choosing which of several pending actions to execute.
+    They send a number (\"1\"), multiple numbers (\"1 2\"), or \"all\".
+    """
+    text    = extract_text_from_message(message_data, message_type).strip().lower()
+    pending = context.get("pending_actions", [])
+
+    if text in ("cancel", "none", "no", "discard"):
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "❌ All requests cancelled.")
+        return
+
+    if text == "all":
+        chosen_indices = list(range(1, len(pending) + 1))
+    else:
+        # Accept: "1", "1 2", "1, 2", "1,2"
+        tokens = re.split(r"[\s,]+", text)
+        chosen_indices = []
+        for tok in tokens:
+            if tok.isdigit():
+                idx = int(tok)
+                if 1 <= idx <= len(pending):
+                    chosen_indices.append(idx)
+
+    if not chosen_indices:
+        green_api_client.send_message(
+            chat_id,
+            f"Please reply with valid number(s) between 1 and {len(pending)}, or *all* / *cancel*.\n\n"
+            f"{_format_action_list(pending)}"
+        )
+        return
+
+    all_last_actions = []
+    for idx in chosen_indices:
+        last = _execute_pipeline_action(chat_id, pending[idx - 1])
+        all_last_actions.extend(last)
+
+    database.update_conversation_state(
+        chat_id, "idle",
+        {"last_actions": all_last_actions} if all_last_actions else {}
+    )
+
+
 
 
 def handle_confirmation_state(chat_id: str, message_data: Dict[str, Any], message_type: str, context: Dict[str, Any]):
-    """Processes yes/no response when awaiting confirmation."""
+    """Processes yes/no response when awaiting reminder confirmation."""
     text = extract_text_from_message(message_data, message_type).lower().strip()
-    
-    # Simple regex parsing could be used, but let's check basic intents
+
     if text in ["yes", "y", "correct", "yeah", "yep"]:
-        dt = datetime.fromisoformat(context["parsed_datetime_utc"])
+        dt   = datetime.fromisoformat(context["parsed_datetime_utc"])
         task = context["task"]
-        
         reminder_id = database.add_reminder(chat_id, task, dt)
-        dt_str = format_datetime_for_user(dt)
-        green_api_client.send_message(chat_id, f"✅ Reminder set: {task} on {dt_str}")
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Reminder set!*\n"
+            f"⏰ *{task}*\n"
+            f"📅 *{format_datetime_for_user(dt)}*"
+        )
         database.update_conversation_state(chat_id, "idle", {"last_actions": [{"type": "reminder", "id": reminder_id}]})
-        
+
     elif text in ["no", "n", "incorrect", "nope", "cancel"]:
         task = context["task"]
-        green_api_client.send_message(chat_id, f"Got it. Please specify the correct date and time for: {task}")
+        green_api_client.send_message(chat_id, f"Got it. Please specify the correct date and time for: *{task}*")
         database.update_conversation_state(chat_id, "awaiting_datetime", {"task": task})
     else:
-        green_api_client.send_message(chat_id, "Please reply YES or NO to confirm the reminder.")
+        green_api_client.send_message(chat_id, "Please reply *YES* or *NO* to confirm the reminder.")
 
 def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], message_type: str, context: Dict[str, Any]):
     """Processes new date/time input for an existing task context."""
     text = extract_text_from_message(message_data, message_type)
-    
-    # We feed it to the NLP parser again, appending the context to help the LLM
     task = context["task"]
     combined_prompt = f"Set reminder for: {task}. When: {text}"
-    
+
     extracted_actions = process_natural_language_reminder(combined_prompt)
     if not extracted_actions:
-        green_api_client.send_message(chat_id, "I still couldn't understand the correct time. Please try saying it clearly, like 'Tomorrow at 6 PM'")
+        green_api_client.send_message(chat_id, "I still couldn't understand the time. Please try again, e.g. 'Tomorrow at 6 PM'.")
         return
-        
+
     extracted = extracted_actions[0]
 
-    if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
-        dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
+    if extracted.get("parsed_datetime_utc"):
+        dt         = datetime.fromisoformat(extracted["parsed_datetime_utc"])
         final_task = extracted.get("task_description", task)
-
         reminder_id = database.add_reminder(chat_id, final_task, dt)
-        dt_str = format_datetime_for_user(dt)
-        green_api_client.send_message(chat_id, f"✅ Reminder set: {final_task} on {dt_str}")
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Reminder set!*\n"
+            f"⏰ *{final_task}*\n"
+            f"📅 *{format_datetime_for_user(dt)}*"
+        )
         database.update_conversation_state(chat_id, "idle", {"last_actions": [{"type": "reminder", "id": reminder_id}]})
     else:
-        green_api_client.send_message(chat_id, "I still couldn't understand the correct time. Please try saying it clearly, like 'Tomorrow at 6 PM'")
+        green_api_client.send_message(chat_id, "I still couldn't understand the time. Please try again, e.g. 'Tomorrow at 6 PM'.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
