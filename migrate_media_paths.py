@@ -19,10 +19,12 @@ DB_PATH  = os.path.join(BASE_DIR, "reminder_bot.db")
 
 # Tables and their media columns
 TARGETS = [
-    ("ideas",     "media_path"),
-    ("notes",     "media_path"),
-    ("resources", "media_path"),
-    ("dumps",     "media_path"),
+    ("ideas",       "media_path"),
+    ("notes",       "media_path"),
+    ("resources",   "media_path"),
+    ("dumps",       "media_path"),
+    ("attachments", "media_path"),
+    ("temp_media",  "file_path"),
 ]
 
 def migrate():
