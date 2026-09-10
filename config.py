@@ -33,9 +33,14 @@ WEBHOOK_PORT: int = int(os.getenv("WEBHOOK_PORT", "5000"))
 # ── Timezone ──────────────────────────────────────────────────────────────────
 TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
 
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Absolute path to the project root directory (same folder as this file).
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+
 # ── Database & Logging ────────────────────────────────────────────────────────
 DB_PATH: str = os.getenv("DB_PATH", "reminder_bot.db")
 LOG_PATH: str = os.getenv("LOG_PATH", "app.log")
+
 
 # ── Optional settings ─────────────────────────────────────────────────────────
 MAX_MESSAGES_PER_HOUR: int = int(os.getenv("MAX_MESSAGES_PER_HOUR", "50"))
