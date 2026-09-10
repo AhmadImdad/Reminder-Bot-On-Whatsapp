@@ -207,18 +207,17 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             logger.warning(f"Ignored message from unauthorized number: {chat_id}")
             return
 
-        # Handle simple commands first (list, cancel, help)
-        if message_type == "text":
-            text = message_data.get("text", {}).get("body", "").strip()
-            logger.info(f"Message text from {chat_id}: '{text}'")
-            if handle_commands(chat_id, text):
-                return
-
         # Handle state machine for conversational flow
         state_data = database.get_conversation_state(chat_id)
         current_state = state_data["state"]
 
         if current_state == "idle":
+            # Only evaluate commands when the user is in idle state
+            if message_type == "text":
+                text = message_data.get("text", {}).get("body", "").strip()
+                logger.info(f"Message text from {chat_id}: '{text}'")
+                if text and handle_commands(chat_id, text):
+                    return
             handle_idle_state(chat_id, message_data, message_type)
         elif current_state == "awaiting_confirmation":
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
@@ -722,12 +721,21 @@ def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: 
         _handle_incoming_media(chat_id, message_data, message_type)
         return
 
+    # If a media batch is currently open for this user, any incoming text is stored
+    # as the caption/note for that batch instead of triggering a separate flow
+    open_batch_id = database.get_open_batch_for_user(chat_id)
+    if open_batch_id:
+        text = extract_text_from_message(message_data, message_type).strip()
+        if text:
+            database.update_batch_caption(open_batch_id, text)
+            logger.info(f"Updated caption for open batch {open_batch_id}: '{text}'")
+        return
+
     # ── TEXT / AUDIO ────────────────────────────────────────────────────────────
-    text = extract_text_from_message(message_data, message_type)
+    text = extract_text_from_message(message_data, message_type).strip()
     if not text:
-        green_api_client.send_message(
-            chat_id, "I couldn't understand that message. Please send text or a voice note."
-        )
+        # Silently ignore empty messages, reactions, or unsupported events
+        logger.debug(f"Ignored empty/non-text event from {chat_id} (type={message_type})")
         return
 
     # ── REMINDER / TASK NLP PIPELINE ────────────────────────────────────────
@@ -1313,8 +1321,8 @@ def handle_awaiting_save_destination_state(
     text_caption  = context.get("text_caption", "")
     description   = text_content or text_caption  # whichever is set
 
-    # ── Discard ───────────────────────────────────────────────────────────
-    if choice in ("6", "discard", "ignore", "no"):
+    # ── Discard / Cancel ──────────────────────────────────────────────────
+    if choice.lower() in ("6", "discard", "ignore", "no", "cancel"):
         if batch_id:
             _discard_batch(chat_id, batch_id)
         database.update_conversation_state(chat_id, "idle", {})
@@ -1331,7 +1339,8 @@ def handle_awaiting_save_destination_state(
             chat_id,
             "Which element should I attach to?\n"
             "Reply with *section + ID*, e.g.:\n"
-            "`resource 5`  /  `idea 2`  /  `note 8`"
+            "`resource 5`  /  `idea 2`  /  `note 8`  /  `dump 3`\n"
+            "Or reply *cancel* to discard."
         )
         return
 
@@ -1346,21 +1355,28 @@ def handle_awaiting_save_destination_state(
         green_api_client.send_message(
             chat_id,
             f"📝 What should be the *subject* for this new {section}?\n"
-            f"Reply with a clear, meaningful title."
+            f"Reply with a clear, meaningful title (e.g. \"Trip expenses\")."
         )
         return
 
     # ── Invalid input ───────────────────────────────────────────────────────
+    # Maintain active saving session rigidly without executing commands or losing state
     green_api_client.send_message(
         chat_id,
-        f"Please reply with a number (1–6):\n{_SAVE_MENU}"
+        "⚠️ Please reply with a valid number from *1* to *6*:\n\n"
+        "1️⃣ Idea\n"
+        "2️⃣ Note\n"
+        "3️⃣ Resource\n"
+        "4️⃣ Dump\n"
+        "5️⃣ Attach to existing element\n"
+        "6️⃣ Discard (Cancel)"
     )
 
 
 def _is_valid_subject(subject: str) -> bool:
     """Returns True if the subject is a real human-provided title."""
     s = subject.strip()
-    if len(s) < 3:
+    if len(s) < 2:
         return False
     if s.isdigit():
         return False

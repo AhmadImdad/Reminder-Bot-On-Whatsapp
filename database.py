@@ -1168,3 +1168,13 @@ def delete_batch_media(batch_id: str) -> None:
     with get_db_connection() as conn:
         conn.execute("DELETE FROM temp_media WHERE batch_id = ?", (batch_id,))
         conn.commit()
+
+
+def update_batch_caption(batch_id: str, caption: str) -> None:
+    """Updates the caption for all rows in an open batch."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE temp_media SET caption = ? WHERE batch_id = ?",
+            (caption, batch_id)
+        )
+        conn.commit()
