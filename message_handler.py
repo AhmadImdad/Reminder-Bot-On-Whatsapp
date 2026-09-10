@@ -228,6 +228,10 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_awaiting_save_destination_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_subject":
             handle_awaiting_subject_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_attach_section":
+            handle_awaiting_attach_section_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_attach_entry":
+            handle_awaiting_attach_entry_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_attach_target":
             handle_awaiting_attach_target_state(chat_id, message_data, message_type, state_data["context"])
         # ── Multi-action selection state ──────────────────────────────────────────
@@ -1331,16 +1335,20 @@ def handle_awaiting_save_destination_state(
 
     # ── Attach to existing ────────────────────────────────────────────────
     if choice == "5":
-        database.update_conversation_state(chat_id, "awaiting_attach_target", {
+        database.update_conversation_state(chat_id, "awaiting_attach_section", {
             "batch_id":     batch_id,
             "text_content": text_content,
+            "text_caption": text_caption,
         })
         green_api_client.send_message(
             chat_id,
-            "Which element should I attach to?\n"
-            "Reply with *section + ID*, e.g.:\n"
-            "`resource 5`  /  `idea 2`  /  `note 8`  /  `dump 3`\n"
-            "Or reply *cancel* to discard."
+            "Which section would you like to attach to?\n\n"
+            "1️⃣ Idea\n"
+            "2️⃣ Note\n"
+            "3️⃣ Resource\n"
+            "4️⃣ Dump\n"
+            "5️⃣ Cancel\n\n"
+            "Reply with a number (1–4), or reply *cancel* to discard."
         )
         return
 
@@ -1466,84 +1474,173 @@ def handle_awaiting_subject_state(
     database.update_conversation_state(chat_id, "idle", {})
 
 
-def handle_awaiting_attach_target_state(
+def handle_awaiting_attach_section_state(
         chat_id: str, message_data: Dict[str, Any],
         message_type: str, context: Dict[str, Any]):
     """
-    User is providing the target for attachment: "resource 5", "idea 2", etc.
-    Validates existence, then attaches files and/or extends description.
+    Step 1 of attachment flow: User picks the section (1: Idea, 2: Note, 3: Resource, 4: Dump).
     """
     if message_type in _SUPPORTED_MEDIA_TYPES:
         _handle_incoming_media(chat_id, message_data, message_type)
         green_api_client.send_message(
-            chat_id, "📦 Got another file! Still waiting — which element should I attach to? (e.g. `resource 5`)"
+            chat_id, "📦 Got another file! Still waiting — which section would you like to attach to? (1–4)"
         )
         return
 
-    text         = extract_text_from_message(message_data, message_type).strip()
-    batch_id     = context.get("batch_id")
+    text = extract_text_from_message(message_data, message_type).strip()
+    batch_id = context.get("batch_id")
     text_content = context.get("text_content", "")
+    text_caption = context.get("text_caption", "")
 
-    if text.lower() in ("discard", "cancel"):
+    if text.lower() in ("5", "cancel", "discard"):
         if batch_id:
             _discard_batch(chat_id, batch_id)
         database.update_conversation_state(chat_id, "idle", {})
         green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
         return
 
-    # Parse "section id" — e.g. "resource 5", "idea 2"
-    match = re.match(r"^(idea|note|resource|dump)\s+(\d+)$", text.lower().strip())
-    if not match:
+    section = _SECTION_NUMBERS.get(text.lower())
+    if not section and text.lower() in ("idea", "note", "resource", "dump"):
+        section = text.lower()
+
+    if not section:
         green_api_client.send_message(
             chat_id,
-            "⚠️ Couldn't parse that. Please reply with *section name + ID*, e.g.:\n"
-            "`resource 5`  /  `idea 2`  /  `note 8`  /  `dump 3`\n"
-            "Or reply *discard* to cancel."
+            "⚠️ Please reply with a valid number (1–4) for the section:\n\n"
+            "1️⃣ Idea\n"
+            "2️⃣ Note\n"
+            "3️⃣ Resource\n"
+            "4️⃣ Dump\n"
+            "5️⃣ Cancel"
         )
         return
 
-    section  = match.group(1)
-    entry_id = int(match.group(2))
-    icon     = _SECTION_ICONS.get(section, "📎")
-
-    # Validate existence
-    if not database.entry_exists(section, entry_id):
+    # Fetch stored entries in this section for the user
+    entries = database.get_section_entries(section, chat_id)
+    if not entries:
         green_api_client.send_message(
             chat_id,
-            f"⚠️ *{section.capitalize()} #{entry_id}* doesn't exist.\n"
-            "Please check the ID and try again, or reply *discard* to cancel."
+            f"You don't have any *{section.capitalize()}s* saved yet.\n\n"
+            "Please choose another section to attach to:\n"
+            "1️⃣ Idea\n"
+            "2️⃣ Note\n"
+            "3️⃣ Resource\n"
+            "4️⃣ Dump\n"
+            "5️⃣ Cancel"
         )
-        return  # keep state so user can retry
+        return
 
+    # Build numbered entry list
+    entry_lines = []
+    entry_ids = []
+    entry_subjects = []
+    for i, row in enumerate(entries, 1):
+        subj = (row["subject"] or f"Untitled {section.capitalize()} #{row['id']}").strip()
+        entry_lines.append(f"*{i}.* {subj}")
+        entry_ids.append(row["id"])
+        entry_subjects.append(subj)
+
+    list_text = "\n".join(entry_lines)
+    database.update_conversation_state(chat_id, "awaiting_attach_entry", {
+        "batch_id": batch_id,
+        "text_content": text_content,
+        "text_caption": text_caption,
+        "section": section,
+        "entry_ids": entry_ids,
+        "entry_subjects": entry_subjects,
+    })
+
+    green_api_client.send_message(
+        chat_id,
+        f"Select the *{section.capitalize()}* you want to attach to:\n\n"
+        f"{list_text}\n\n"
+        f"Reply with a number (e.g. *1* or *2*), or reply *cancel* to discard."
+    )
+
+
+def handle_awaiting_attach_entry_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """
+    Step 2 of attachment flow: User picks the specific entry number (1..N).
+    Appends the media and/or text with the '*Extension:*' heading automatically.
+    """
+    if message_type in _SUPPORTED_MEDIA_TYPES:
+        _handle_incoming_media(chat_id, message_data, message_type)
+        green_api_client.send_message(
+            chat_id, "📦 Got another file! Still waiting — please reply with the entry number to attach to."
+        )
+        return
+
+    text = extract_text_from_message(message_data, message_type).strip()
+    batch_id = context.get("batch_id")
+    text_content = context.get("text_content", "")
+    text_caption = context.get("text_caption", "")
+    section = context.get("section")
+    entry_ids = context.get("entry_ids", [])
+    entry_subjects = context.get("entry_subjects", [])
+
+    if text.lower() in ("cancel", "discard"):
+        if batch_id:
+            _discard_batch(chat_id, batch_id)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
+        return
+
+    valid_idx = None
+    if text.isdigit():
+        val = int(text)
+        if 1 <= val <= len(entry_ids):
+            valid_idx = val - 1
+
+    if valid_idx is None:
+        green_api_client.send_message(
+            chat_id,
+            f"⚠️ Please reply with a valid number between *1* and *{len(entry_ids)}* from the list above, "
+            f"or reply *cancel* to discard."
+        )
+        return
+
+    entry_id = entry_ids[valid_idx]
+    entry_subject = entry_subjects[valid_idx]
+    icon = _SECTION_ICONS.get(section, "📎")
     section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
-    rows        = database.get_batch_media(batch_id, chat_id) if batch_id else []
-    actions     = []
+    rows = database.get_batch_media(batch_id, chat_id) if batch_id else []
+    actions = []
 
-    # Attach files
+    # 1. Attach media files
     for row in rows:
         new_path = _move_temp_to_section(row["file_path"], section_dir)
         if new_path:
             database.add_attachment(section, entry_id, chat_id, row["media_type"], new_path, row["original_name"])
-            actions.append(f"  📎 {row['original_name'] or row['media_type']}")
+            actions.append(f"📎 {row['original_name'] or row['media_type']}")
 
     if batch_id:
         database.delete_batch_media(batch_id)
 
-    # Extend description with text
-    if text_content:
-        ok = database.extend_entry_description(section, entry_id, chat_id, text_content)
+    # 2. Append text extension (from text message or batch caption)
+    text_to_extend = text_content or text_caption
+    if text_to_extend:
+        ok = database.extend_entry_description(section, entry_id, chat_id, text_to_extend)
         if ok:
-            actions.append("  📝 Text appended with extension header")
+            actions.append("📝 Text extension appended")
         else:
-            actions.append("  ⚠️ Text could not be appended")
+            actions.append("⚠️ Text could not be appended")
 
     database.update_conversation_state(chat_id, "idle", {})
 
-    summary = "\n".join(actions) if actions else "  (nothing to attach)"
+    summary = "\n  ".join(actions) if actions else "Nothing to attach"
     green_api_client.send_message(
         chat_id,
-        f"{icon} *{section.capitalize()} #{entry_id}* extended:\n{summary}"
+        f"🔗 Successfully attached to {icon} *{section.capitalize()} #{entry_id}* (*{entry_subject}*):\n  {summary}"
     )
+
+
+def handle_awaiting_attach_target_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """Fallback handler for legacy awaiting_attach_target state."""
+    handle_awaiting_attach_section_state(chat_id, message_data, message_type, context)
 
 
 

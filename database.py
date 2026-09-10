@@ -791,6 +791,7 @@ def wipe_user_content(phone: str) -> tuple[int, list]:
 def extend_entry_description(section: str, entry_id: int, user_phone: str, extension_text: str) -> bool:
     """
     Appends extension_text to an existing entry's description field.
+    Prefixes extension_text with a newline and '*Extension:*' heading.
     Creates the description field if it was previously NULL.
     Returns True on success.
     """
@@ -798,11 +799,10 @@ def extend_entry_description(section: str, entry_id: int, user_phone: str, exten
         "idea": "ideas", "note": "notes",
         "resource": "resources", "dump": "dumps"
     }
-    table = table_map.get(section)
+    table = table_map.get(section.lower())
     if not table:
         return False
 
-    separator = "\n\n──────────── Extension ────────────\n"
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -813,8 +813,11 @@ def extend_entry_description(section: str, entry_id: int, user_phone: str, exten
         if not row:
             return False
 
-        existing = row["description"] or ""
-        new_desc = (existing + separator + extension_text) if existing else (separator.strip() + "\n" + extension_text)
+        existing = (row["description"] or "").strip()
+        if existing:
+            new_desc = f"{existing}\n\n*Extension:*\n{extension_text.strip()}"
+        else:
+            new_desc = f"*Extension:*\n{extension_text.strip()}"
 
         cursor.execute(
             f"UPDATE {table} SET description = ? WHERE id = ? AND user_phone = ?",
@@ -822,6 +825,24 @@ def extend_entry_description(section: str, entry_id: int, user_phone: str, exten
         )
         conn.commit()
         return cursor.rowcount > 0
+
+
+def get_section_entries(section: str, user_phone: str) -> List[sqlite3.Row]:
+    """Returns all entries for a given section ('idea', 'note', 'resource', 'dump') for a user, ordered by id ASC."""
+    table_map = {
+        "idea": "ideas", "note": "notes",
+        "resource": "resources", "dump": "dumps"
+    }
+    table = table_map.get(section.lower())
+    if not table:
+        return []
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT id, subject, description, created_at FROM {table} WHERE user_phone = ? ORDER BY id ASC",
+            (user_phone,)
+        )
+        return cursor.fetchall()
 
 
 
