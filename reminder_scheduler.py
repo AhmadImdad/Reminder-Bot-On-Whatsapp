@@ -65,7 +65,8 @@ def discard_expired_temp_media():
         row_id = row['id']
 
         # Resolve absolute path
-        abs_path = os.path.join(config.BASE_DIR, file_path) if not os.path.isabs(file_path) else file_path
+        base_dir = getattr(config, "BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+        abs_path = os.path.join(base_dir, file_path) if not os.path.isabs(file_path) else file_path
 
         logger.info(f"Discarding expired temp media {abs_path} for {user_phone}")
 
