@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Dict, Any
@@ -8,13 +9,13 @@ import database
 import meta_api_client as green_api_client  # drop-in replacement for Green API
 import groq_client
 import config
+import compressor
 from nlp_parser import (
     process_natural_language_reminder,
     process_idea_message,
     process_note_message,
     process_resource_message,
     process_dump_message,
-    process_media_caption,
 )
 from utils import format_datetime_for_user, local_to_utc, utc_to_local
 
@@ -212,10 +213,14 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_datetime":
             handle_awaiting_datetime_state(chat_id, message_data, message_type, state_data["context"])
-        elif current_state == "awaiting_media_intent":
-            handle_awaiting_media_intent_state(chat_id, message_data, message_type, state_data["context"])
-        elif current_state == "awaiting_batch_subject":
-            handle_awaiting_batch_subject_state(chat_id, message_data, message_type, state_data["context"])
+        # ── NEW guided-save states ──────────────────────────────────────────────
+        elif current_state == "awaiting_save_destination":
+            handle_awaiting_save_destination_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_subject":
+            handle_awaiting_subject_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_attach_target":
+            handle_awaiting_attach_target_state(chat_id, message_data, message_type, state_data["context"])
+        # ── Legacy states (kept for reminders / confirmation) ────────────────────
         elif current_state == "awaiting_section_confirmation":
             handle_awaiting_section_confirmation_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_titan_response":
@@ -655,236 +660,120 @@ def format_reminders_table(reminders: list) -> str:
     return table
 
 def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: str):
-    """Processes message when bot is idle (expecting a new command/reminder)."""
-
-    # ── MEDIA-ONLY / MEDIA+CAPTION MESSAGES ──────────────────────────────────
-    # If the message is a media type, we save the file immediately (URLs are short-lived)
-    # then route based on caption intent or ask the user what to do.
-    if message_type in _SUPPORTED_MEDIA_TYPES and message_type != "audio":
+    """Processes message when bot is idle.
+    Media  → batch accumulation (15-second window, guided menu when ready).
+    Text   → reminder/task pipeline first; anything unrecognised → guided save offer.
+    """
+    # ── MEDIA ─────────────────────────────────────────────────────────────────
+    if message_type in _SUPPORTED_MEDIA_TYPES:
         _handle_incoming_media(chat_id, message_data, message_type)
         return
 
-    # ── TEXT ONLY / AUDIO (transcribed) ──────────────────────────────────────
+    # ── TEXT / AUDIO ──────────────────────────────────────────────────────────
     text = extract_text_from_message(message_data, message_type)
     if not text:
         green_api_client.send_message(
-            chat_id,
-            "I couldn't understand that message. Please send text or a voice note."
+            chat_id, "I couldn't understand that message. Please send text or a voice note."
         )
         return
-
-    # ── IDEA PRE-CHECK ────────────────────────────────────────────────────────
-    idea_result = process_idea_message(text)
-    if idea_result is None:
-        green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
-        return
-    if idea_result.get("is_idea"):
-        confidence = idea_result.get("confidence", "low")
-        if confidence == "high":
-            handle_idea_capture(chat_id, idea_result, message_data, message_type)
-            return
-        elif confidence == "medium":
-            subject = idea_result.get("subject", "your message")
-            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
-                "section": "idea", "subject": subject,
-                "description": idea_result.get("description", ""), "temp_media_id": None
-            })
-            green_api_client.send_message(
-                chat_id,
-                f"💡 I think you want to save this as an *idea*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
-            )
-            return
-        # low confidence — fall through to reminder/task pipeline
-
-    # ── NOTE PRE-CHECK ────────────────────────────────────────────────────────
-    note_result = process_note_message(text)
-    if note_result is None:
-        green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
-        return
-    if note_result.get("is_note"):
-        confidence = note_result.get("confidence", "low")
-        if confidence == "high":
-            handle_note_capture(chat_id, note_result, message_data, message_type)
-            return
-        elif confidence == "medium":
-            subject = note_result.get("subject", "your message")
-            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
-                "section": "note", "subject": subject,
-                "description": note_result.get("description", ""), "temp_media_id": None
-            })
-            green_api_client.send_message(
-                chat_id,
-                f"📓 I think you want to save this as a *note*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
-            )
-            return
-
-    # ── RESOURCE PRE-CHECK ────────────────────────────────────────────────────
-    resource_result = process_resource_message(text)
-    if resource_result is None:
-        green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
-        return
-    if resource_result.get("is_resource"):
-        confidence = resource_result.get("confidence", "low")
-        if confidence == "high":
-            handle_resource_capture(chat_id, resource_result, message_data, message_type)
-            return
-        elif confidence == "medium":
-            subject = resource_result.get("subject", "your message")
-            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
-                "section": "resource", "subject": subject,
-                "description": resource_result.get("description", ""), "temp_media_id": None
-            })
-            green_api_client.send_message(
-                chat_id,
-                f"🔗 I think you want to save this as a *resource*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
-            )
-            return
-
-    # ── DUMP PRE-CHECK ────────────────────────────────────────────────────────
-    dump_result = process_dump_message(text)
-    if dump_result is None:
-        green_api_client.send_message(chat_id, "⚠️ I had trouble processing your message. Please try again.")
-        return
-    if dump_result.get("is_dump"):
-        confidence = dump_result.get("confidence", "low")
-        if confidence == "high":
-            handle_dump_capture(chat_id, dump_result, message_data, message_type)
-            return
-        elif confidence == "medium":
-            subject = dump_result.get("subject", "your message")
-            database.update_conversation_state(chat_id, "awaiting_section_confirmation", {
-                "section": "dump", "subject": subject,
-                "description": dump_result.get("description", ""), "temp_media_id": None
-            })
-            green_api_client.send_message(
-                chat_id,
-                f"🗑️ I think you want to save this as a *dump*:\n📌 *{subject}*\n\nIs that correct? Reply *YES* or *NO*."
-            )
-            return
 
     # ── REMINDER / TASK PIPELINE ──────────────────────────────────────────────
     extracted_actions = process_natural_language_reminder(text)
 
     responses = []
     last_actions = []
-    show_tasks_table = False
-    task_filter_status = "all"
+    show_tasks_table     = False
+    task_filter_status   = "all"
     show_reminders_table = False
-    
+    handled_by_pipeline  = False
+
     for extracted in extracted_actions:
         intent = extracted.get("intent", "none")
-        
-        if intent == "none":
-            responses.append("I couldn't understand part of your request. Please try again.")
-            continue
-            
-        elif intent == "list_tasks":
-            show_tasks_table = True
-            task_filter_status = "all"
-            
-        elif intent == "list_pending_tasks":
-            show_tasks_table = True
-            task_filter_status = "pending"
 
+        if intent == "none":
+            continue   # fall through to guided-save offer
+
+        handled_by_pipeline = True
+
+        if intent == "list_tasks":
+            show_tasks_table = True; task_filter_status = "all"
+        elif intent == "list_pending_tasks":
+            show_tasks_table = True; task_filter_status = "pending"
         elif intent == "list_completed_tasks":
-            show_tasks_table = True
-            task_filter_status = "completed"
-            
+            show_tasks_table = True; task_filter_status = "completed"
         elif intent == "list_reminders":
             show_reminders_table = True
-            
         elif intent == "remove_task":
             list_id_to_remove = extracted.get("target_list_id")
             if list_id_to_remove is None:
                 responses.append("Please specify which task number you want to remove.")
             else:
                 success = database.delete_task_by_offset(chat_id, list_id_to_remove - 1)
+                responses.append("✅ Task removed." if success else f"❌ Could not find active task number {list_id_to_remove}.")
                 if success:
-                    responses.append(f"✅ Task removed.")
                     show_tasks_table = True
-                else:
-                    responses.append(f"❌ Could not find active task number {list_id_to_remove}.")
-                    
         elif intent == "complete_task":
             list_id_to_complete = extracted.get("target_list_id")
             if list_id_to_complete is None:
                 responses.append("Please specify which task number you want to complete.")
             else:
                 success = database.mark_task_completed_by_offset(chat_id, list_id_to_complete - 1)
+                responses.append("✅ Task completed!" if success else f"❌ Could not find active task number {list_id_to_complete}.")
                 if success:
-                    responses.append(f"✅ Task completed!")
                     show_tasks_table = True
-                else:
-                    responses.append(f"❌ Could not find active task number {list_id_to_complete}.")
-                    
         elif intent == "add_task":
             task_desc = extracted.get("task_description", "")
             if not task_desc:
                 responses.append("Please tell me what the task is.")
                 continue
-                
             dt = None
-            if "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+            if extracted.get("parsed_datetime_utc"):
                 dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-                
             task_id = database.add_task(chat_id, task_desc, dt)
             last_actions.append({"type": "task", "id": task_id})
-            responses.append(f"✅ Task added successfully!")
+            responses.append("✅ Task added successfully!")
             show_tasks_table = True
-            
         elif intent == "add_reminder":
             task = extracted.get("task_description", "")
             confidence = extracted.get("confidence", "low")
-            
-            if confidence == "high" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+            if confidence == "high" and extracted.get("parsed_datetime_utc"):
                 dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
                 reminder_id = database.add_reminder(chat_id, task, dt)
                 last_actions.append({"type": "reminder", "id": reminder_id})
-                
-                dt_str = format_datetime_for_user(dt)
-                responses.append(f"✅ Reminder set: {task} on {dt_str}")
-                
-            elif confidence == "medium" and "parsed_datetime_utc" in extracted and extracted["parsed_datetime_utc"]:
+                responses.append(f"✅ Reminder set: {task} on {format_datetime_for_user(dt)}")
+            elif confidence == "medium" and extracted.get("parsed_datetime_utc"):
                 dt = datetime.fromisoformat(extracted["parsed_datetime_utc"])
-                dt_str = format_datetime_for_user(dt)
-                
-                responses.append(f"I understood: {task} on {dt_str}. Is this correct? Reply YES or NO.")
-                context = {
-                    "task": task,
-                    "parsed_datetime_utc": extracted["parsed_datetime_utc"]
-                }
-                database.update_conversation_state(chat_id, "awaiting_confirmation", context)
+                responses.append(f"I understood: {task} on {format_datetime_for_user(dt)}. Is this correct? Reply YES or NO.")
+                database.update_conversation_state(chat_id, "awaiting_confirmation", {
+                    "task": task, "parsed_datetime_utc": extracted["parsed_datetime_utc"]
+                })
                 break
-                
             else:
                 error_msg = extracted.get("error", "")
                 if error_msg == "The specified time is in the past.":
                     responses.append(f"You asked to be reminded about: {task}. But the time seems to be in the past. When should I remind you?")
                 else:
                     responses.append(f"I want to remind you about: {task}. When should I remind you? Please provide date and time.")
-                    
-                context = {"task": task}
-                database.update_conversation_state(chat_id, "awaiting_datetime", context)
+                database.update_conversation_state(chat_id, "awaiting_datetime", {"task": task})
                 break
 
     final_msg = "\n".join(responses)
     if show_tasks_table:
         tasks = database.get_user_tasks(chat_id)
         final_msg += ("\n\n" if final_msg else "") + format_tasks_table(tasks, filter_status=task_filter_status)
-        
     if show_reminders_table:
         reminders = database.get_user_pending_reminders(chat_id)
         final_msg += ("\n\n" if final_msg else "") + format_reminders_table(reminders)
-        
     if final_msg:
         green_api_client.send_message(chat_id, final_msg)
-
-    # Save last_actions if any tasks or reminders were created
     if last_actions:
         database.update_conversation_state(chat_id, "idle", {"last_actions": last_actions})
-    elif not any(r for r in responses if "Is this correct?" in r or "When should I remind you?" in r):
-        # Don't overwrite state if we are awaiting confirmation
-        pass
+
+    # ── GUIDED SAVE OFFER for unrecognised text ───────────────────────────────
+    if not handled_by_pipeline:
+        _offer_text_save(chat_id, text)
+
+
 def handle_confirmation_state(chat_id: str, message_data: Dict[str, Any], message_type: str, context: Dict[str, Any]):
     """Processes yes/no response when awaiting confirmation."""
     text = extract_text_from_message(message_data, message_type).lower().strip()
@@ -937,13 +826,32 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
 # TEMP MEDIA + MULTI-MEDIA ATTACHMENT HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _offer_text_save(chat_id: str, text: str) -> None:
+    """Offers the guided save menu for an unrecognised text message."""
+    preview = text[:80] + ("..." if len(text) > 80 else "")
+    database.update_conversation_state(chat_id, "awaiting_save_destination", {
+        "text_content": text
+    })
+    green_api_client.send_message(
+        chat_id,
+        f"💬 I received your message:\n“{preview}”\n\n"
+        "What should I do with it?\n"
+        "1️⃣ Save as Idea\n"
+        "2️⃣ Save as Note\n"
+        "3️⃣ Save as Resource\n"
+        "4️⃣ Save as Dump\n"
+        "5️⃣ Attach to existing element\n"
+        "6️⃣ Ignore"
+    )
+
+
 def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_type: str):
     """
-    Called when a media message arrives in idle state.
-    Saves file immediately (Meta URLs are short-lived), then adds it to the
-    user's current open batch. The batch is processed by the scheduler after
-    the 15-second window closes with no new arrivals.
-    Multiple files sent in quick succession are silently accumulated.
+    Called when a media message arrives.
+    1. Downloads to temp_media/ immediately (Meta URLs are short-lived).
+    2. Runs compressor.check_file_size(); rejects oversized audio/video/docs.
+    3. Runs compressor.compress_image() if image is over 4.5 MB.
+    4. Adds file to the user's current 15-second batch.
     """
     media_type, temp_path, original_name = _extract_and_save_media(
         message_data, message_type, TEMP_MEDIA_DIR, "temp"
@@ -951,31 +859,48 @@ def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_t
 
     if not media_type or not temp_path:
         green_api_client.send_message(
-            chat_id,
-            "⚠️ I couldn't download that file. Please try sending it again."
+            chat_id, "⚠️ I couldn't download that file. Please try sending it again."
         )
         return
 
-    # Extract caption (only the first image in a multi-send has one)
-    caption = (message_data.get(message_type) or {}).get("caption", "").strip() or None
+    abs_path = _resolve_media_path(temp_path)
 
-    # Check if user already has an open batch within the 15s window
+    # ── Size / compression checks ─────────────────────────────────────────────
+    ok, rejection_msg = compressor.check_file_size(abs_path, media_type)
+    if not ok:
+        green_api_client.send_message(chat_id, rejection_msg)
+        try:
+            os.remove(abs_path)
+        except Exception:
+            pass
+        return
+
+    if media_type == "image":
+        file_size = compressor._file_size(abs_path)
+        if file_size > compressor.IMAGE_LIMIT_BYTES:
+            logger.info(f"Image {abs_path} is {file_size/1024/1024:.1f} MB — compressing...")
+            _, success, err_msg = compressor.compress_image(abs_path)
+            if not success:
+                green_api_client.send_message(chat_id, err_msg)
+                try:
+                    os.remove(abs_path)
+                except Exception:
+                    pass
+                return
+            logger.info("Image compressed successfully.")
+
+    # ── Add to batch ──────────────────────────────────────────────────────────
+    caption = (message_data.get(message_type) or {}).get("caption", "").strip() or None
     existing_batch_id = database.get_open_batch_for_user(chat_id)
 
     if existing_batch_id:
-        # Silently add to existing batch — reset its window
         temp_id = database.add_temp_media(
             chat_id, temp_path, media_type, original_name,
             caption=caption, batch_id=existing_batch_id
         )
-        # Update batch_last_updated so window resets
         database.assign_to_batch(temp_id, existing_batch_id)
-        logger.info(
-            f"Added file to existing batch {existing_batch_id} for {chat_id} "
-            f"(total files in batch now accumulating)"
-        )
+        logger.info(f"Added file to existing batch {existing_batch_id} for {chat_id}")
     else:
-        # First file — create a new batch
         new_batch_id = str(uuid.uuid4())
         database.add_temp_media(
             chat_id, temp_path, media_type, original_name,
@@ -983,8 +908,6 @@ def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_t
         )
         logger.info(f"Created new media batch {new_batch_id} for {chat_id}")
 
-    # Do NOT send any message yet — wait for the batch window to close
-    # The scheduler's process_ready_media_batches() will handle it
 
 
 def _execute_media_intent(chat_id: str, intent_result: dict,
@@ -1115,67 +1038,303 @@ def _discard_batch(chat_id: str, batch_id: str):
 def process_media_batch(batch_id: str, user_phone: str, caption: str):
     """
     Called by the scheduler once a batch's 15-second window has closed.
-    Processes all media files in the batch together as one unit.
-    Caption from the first file applies to all.
+    Presents the guided numbered save menu to the user.
+    Caption (if any) is stored in context for later use as description.
     """
     rows = database.get_batch_media(batch_id, user_phone)
     if not rows:
         logger.warning(f"Batch {batch_id} has no rows — skipping")
         return
 
-    file_count = len(rows)
-    file_word  = "file" if file_count == 1 else "files"
-    icon_map   = {"image": "🖼️", "video": "🎥", "audio": "🎤", "document": "📄", "sticker": "🙌"}
-    type_summary = ", ".join(
-        f"{icon_map.get(r['media_type'], '📎')}{r['original_name'] or r['media_type']}"
+    file_count  = len(rows)
+    file_word   = "file" if file_count == 1 else "files"
+    icon_map    = {"image": "🖼️", "video": "🎥", "audio": "🎤", "document": "📄", "sticker": "🙌"}
+    file_list   = ", ".join(
+        f"{icon_map.get(r['media_type'], '📎')} {r['original_name'] or r['media_type']}"
         for r in rows
     )
 
-    if caption:
-        result     = process_media_caption(caption)
-        confidence = result.get("confidence", "low")
-    else:
-        result     = {"intent": "unclear", "confidence": "low"}
-        confidence = "low"
+    # Store batch_id + any caption as description seed in context
+    database.update_conversation_state(user_phone, "awaiting_save_destination", {
+        "batch_id":    batch_id,
+        "text_caption": caption or "",
+    })
 
-    if confidence == "high":
-        success = _execute_batch_intent(user_phone, result, batch_id, rows)
-        if success:
-            return
-        # If execution failed, fall through to ask
-
-    elif confidence == "medium":
-        section  = result.get("section", "unknown")
-        entry_id = result.get("entry_id")
-        if entry_id:
-            prompt = (
-                f"📦 I received *{file_count} {file_word}*: {type_summary}\n\n"
-                f"I think you want to attach them all to *{section} #{entry_id}*. "
-                f"Is that right? Reply *YES* or *NO*."
-            )
-        else:
-            prompt = (
-                f"📦 I received *{file_count} {file_word}*: {type_summary}\n\n"
-                f"I think you want to save them all as a new *{section}*. "
-                f"Is that right? Reply *YES* or *NO*."
-            )
-        database.update_conversation_state(user_phone, "awaiting_media_intent", {
-            "batch_id": batch_id,
-            "pending_result": result
-        })
-        green_api_client.send_message(user_phone, prompt)
-        return
-
-    # Low confidence or no caption — ask user once for the whole batch
-    database.update_conversation_state(user_phone, "awaiting_media_intent", {"batch_id": batch_id})
     green_api_client.send_message(
         user_phone,
-        f"📦 I received *{file_count} {file_word}*:\n{type_summary}\n\n"
-        "What should I do with them? Reply with:\n"
-        "- *new idea* / *new note* / *new resource* / *new dump*\n"
-        "- *attach to idea 3* (or any section + ID)\n"
-        "- *discard* to delete them all"
+        f"📦 I received *{file_count} {file_word}*:\n{file_list}\n\n"
+        "Where should I save them?\n"
+        "1️⃣ Idea\n"
+        "2️⃣ Note\n"
+        "3️⃣ Resource\n"
+        "4️⃣ Dump\n"
+        "5️⃣ Attach to existing element\n"
+        "6️⃣ Discard"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GUIDED SAVE STATES
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SECTION_NUMBERS = {"1": "idea", "2": "note", "3": "resource", "4": "dump"}
+_SECTION_ICONS   = {"idea": "💡", "note": "📓", "resource": "🔗", "dump": "🗑️"}
+
+_SAVE_MENU = (
+    "Where should I save it?\n"
+    "1️⃣ Idea\n2️⃣ Note\n3️⃣ Resource\n4️⃣ Dump\n"
+    "5️⃣ Attach to existing element\n6️⃣ Discard"
+)
+
+
+def handle_awaiting_save_destination_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """
+    User is picking from the numbered save menu (1–6).
+    More media arriving in this state is silently added to the batch.
+    """
+    # If more media arrives, silently accumulate
+    if message_type in _SUPPORTED_MEDIA_TYPES:
+        _handle_incoming_media(chat_id, message_data, message_type)
+        # Update file list in message
+        batch_id = context.get("batch_id")
+        if batch_id:
+            rows = database.get_batch_media(batch_id, chat_id)
+            icon_map = {"image": "🖼️", "video": "🎥", "audio": "🎤", "document": "📄"}
+            file_list = ", ".join(
+                f"{icon_map.get(r['media_type'], '📎')} {r['original_name'] or r['media_type']}"
+                for r in rows
+            )
+            green_api_client.send_message(
+                chat_id,
+                f"📦 Now {len(rows)} file(s): {file_list}\n\n{_SAVE_MENU}"
+            )
+        return
+
+    text    = extract_text_from_message(message_data, message_type).strip()
+    choice  = text.strip()
+    batch_id      = context.get("batch_id")
+    text_content  = context.get("text_content", "")
+    text_caption  = context.get("text_caption", "")
+    description   = text_content or text_caption  # whichever is set
+
+    # ── Discard ───────────────────────────────────────────────────────────
+    if choice in ("6", "discard", "ignore", "no"):
+        if batch_id:
+            _discard_batch(chat_id, batch_id)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "🗑️ Discarded. Nothing was saved.")
+        return
+
+    # ── Attach to existing ────────────────────────────────────────────────
+    if choice == "5":
+        database.update_conversation_state(chat_id, "awaiting_attach_target", {
+            "batch_id":     batch_id,
+            "text_content": text_content,
+        })
+        green_api_client.send_message(
+            chat_id,
+            "Which element should I attach to?\n"
+            "Reply with *section + ID*, e.g.:\n"
+            "`resource 5`  /  `idea 2`  /  `note 8`"
+        )
+        return
+
+    # ── New section (1–4) ───────────────────────────────────────────────────
+    section = _SECTION_NUMBERS.get(choice)
+    if section:
+        database.update_conversation_state(chat_id, "awaiting_subject", {
+            "batch_id":    batch_id,
+            "section":     section,
+            "description": description,
+        })
+        green_api_client.send_message(
+            chat_id,
+            f"📝 What should be the *subject* for this new {section}?\n"
+            f"Reply with a clear, meaningful title."
+        )
+        return
+
+    # ── Invalid input ───────────────────────────────────────────────────────
+    green_api_client.send_message(
+        chat_id,
+        f"Please reply with a number (1–6):\n{_SAVE_MENU}"
+    )
+
+
+def _is_valid_subject(subject: str) -> bool:
+    """Returns True if the subject is a real human-provided title."""
+    s = subject.strip()
+    if len(s) < 3:
+        return False
+    if s.isdigit():
+        return False
+    return True
+
+
+def handle_awaiting_subject_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """
+    User is providing the subject for a new section entry.
+    Validates and saves everything once a good subject is received.
+    """
+    # Allow more media to arrive while typing subject
+    if message_type in _SUPPORTED_MEDIA_TYPES:
+        _handle_incoming_media(chat_id, message_data, message_type)
+        green_api_client.send_message(
+            chat_id, "📦 Got another file! 📝 Still waiting for the subject — please reply with a title."
+        )
+        return
+
+    text    = extract_text_from_message(message_data, message_type).strip()
+    batch_id    = context.get("batch_id")
+    section     = context.get("section")
+    description = context.get("description", "")
+
+    if text.lower() in ("discard", "cancel"):
+        if batch_id:
+            _discard_batch(chat_id, batch_id)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
+        return
+
+    subject = text
+    if not _is_valid_subject(subject):
+        green_api_client.send_message(
+            chat_id,
+            "That doesn't look like a clear subject. "
+            "Please reply with a proper title (e.g. \"Product launch photos\")\n"
+            "Or reply *discard* to cancel."
+        )
+        return  # keep state, ask again
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+    icon        = _SECTION_ICONS.get(section, "📎")
+    rows        = database.get_batch_media(batch_id, chat_id) if batch_id else []
+
+    if rows:
+        first = rows[0]
+        rest  = rows[1:]
+
+        first_path = _move_temp_to_section(first["file_path"], section_dir)
+        if not first_path:
+            green_api_client.send_message(chat_id, "⚠️ Could not save the primary file. Please try again.")
+            database.update_conversation_state(chat_id, "idle", {})
+            return
+
+        entry_id = _save_new_section_entry(
+            chat_id, section, subject, description or None,
+            first["media_type"], first_path, first["original_name"]
+        )
+        for row in rest:
+            new_path = _move_temp_to_section(row["file_path"], section_dir)
+            if new_path:
+                database.add_attachment(section, entry_id, chat_id, row["media_type"], new_path, row["original_name"])
+
+        database.delete_batch_media(batch_id)
+        extra = f" + {len(rest)} more attachment(s)" if rest else ""
+        desc_line = f"\n📝 Description saved" if description else ""
+        green_api_client.send_message(
+            chat_id,
+            f"{icon} *{section.capitalize()} #{entry_id} saved!*\n"
+            f"📌 *Subject:* {subject}{desc_line}\n"
+            f"📎 1 primary file{extra}"
+        )
+    else:
+        # Text-only save (no batch media)
+        entry_id = _save_new_section_entry(chat_id, section, subject, description or None, None, None, None)
+        green_api_client.send_message(
+            chat_id,
+            f"{icon} *{section.capitalize()} #{entry_id} saved!*\n"
+            f"📌 *Subject:* {subject}" +
+            (f"\n📝 *Description:* {description[:60]}{'...' if len(description)>60 else ''}" if description else "")
+        )
+
+    database.update_conversation_state(chat_id, "idle", {})
+
+
+def handle_awaiting_attach_target_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """
+    User is providing the target for attachment: "resource 5", "idea 2", etc.
+    Validates existence, then attaches files and/or extends description.
+    """
+    if message_type in _SUPPORTED_MEDIA_TYPES:
+        _handle_incoming_media(chat_id, message_data, message_type)
+        green_api_client.send_message(
+            chat_id, "📦 Got another file! Still waiting — which element should I attach to? (e.g. `resource 5`)"
+        )
+        return
+
+    text         = extract_text_from_message(message_data, message_type).strip()
+    batch_id     = context.get("batch_id")
+    text_content = context.get("text_content", "")
+
+    if text.lower() in ("discard", "cancel"):
+        if batch_id:
+            _discard_batch(chat_id, batch_id)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
+        return
+
+    # Parse "section id" — e.g. "resource 5", "idea 2"
+    match = re.match(r"^(idea|note|resource|dump)\s+(\d+)$", text.lower().strip())
+    if not match:
+        green_api_client.send_message(
+            chat_id,
+            "⚠️ Couldn't parse that. Please reply with *section name + ID*, e.g.:\n"
+            "`resource 5`  /  `idea 2`  /  `note 8`  /  `dump 3`\n"
+            "Or reply *discard* to cancel."
+        )
+        return
+
+    section  = match.group(1)
+    entry_id = int(match.group(2))
+    icon     = _SECTION_ICONS.get(section, "📎")
+
+    # Validate existence
+    if not database.entry_exists(section, entry_id):
+        green_api_client.send_message(
+            chat_id,
+            f"⚠️ *{section.capitalize()} #{entry_id}* doesn't exist.\n"
+            "Please check the ID and try again, or reply *discard* to cancel."
+        )
+        return  # keep state so user can retry
+
+    section_dir = SECTION_META.get(section, TEMP_MEDIA_DIR)
+    rows        = database.get_batch_media(batch_id, chat_id) if batch_id else []
+    actions     = []
+
+    # Attach files
+    for row in rows:
+        new_path = _move_temp_to_section(row["file_path"], section_dir)
+        if new_path:
+            database.add_attachment(section, entry_id, chat_id, row["media_type"], new_path, row["original_name"])
+            actions.append(f"  📎 {row['original_name'] or row['media_type']}")
+
+    if batch_id:
+        database.delete_batch_media(batch_id)
+
+    # Extend description with text
+    if text_content:
+        ok = database.extend_entry_description(section, entry_id, chat_id, text_content)
+        if ok:
+            actions.append("  📝 Text appended with extension header")
+        else:
+            actions.append("  ⚠️ Text could not be appended")
+
+    database.update_conversation_state(chat_id, "idle", {})
+
+    summary = "\n".join(actions) if actions else "  (nothing to attach)"
+    green_api_client.send_message(
+        chat_id,
+        f"{icon} *{section.capitalize()} #{entry_id}* extended:\n{summary}"
+    )
+
 
 
 def _is_meaningful_subject(subject: str) -> bool:

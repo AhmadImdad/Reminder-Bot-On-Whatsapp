@@ -730,6 +730,101 @@ def remove_allowed_user(phone: str) -> bool:
         return True
 
 
+def wipe_user_content(phone: str) -> tuple[int, list]:
+    """
+    Wipes ALL content belonging to a user but KEEPS their account in allowed_users.
+    Also collects all media file paths from the DB before deletion so the caller
+    can delete them from disk.
+
+    Returns:
+        (rows_deleted: int, media_file_paths: list[str])
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Collect all media paths before deleting
+        media_paths = []
+        for table, col in [("ideas", "media_path"), ("notes", "media_path"),
+                            ("resources", "media_path"), ("dumps", "media_path")]:
+            cursor.execute(
+                f"SELECT {col} FROM {table} WHERE user_phone = ? AND {col} IS NOT NULL",
+                (phone,)
+            )
+            for row in cursor.fetchall():
+                if row[0]:
+                    media_paths.append(row[0])
+
+        # Attachment file paths
+        cursor.execute(
+            "SELECT media_path FROM attachments WHERE user_phone = ? AND media_path IS NOT NULL",
+            (phone,)
+        )
+        for row in cursor.fetchall():
+            if row[0]:
+                media_paths.append(row[0])
+
+        # Temp media file paths
+        cursor.execute(
+            "SELECT file_path FROM temp_media WHERE user_phone = ? AND file_path IS NOT NULL",
+            (phone,)
+        )
+        for row in cursor.fetchall():
+            if row[0]:
+                media_paths.append(row[0])
+
+        # Delete all content rows (but NOT allowed_users)
+        total_deleted = 0
+        content_tables = [
+            "ideas", "notes", "resources", "dumps",
+            "reminders", "tasks", "attachments", "temp_media",
+            "messages", "conversation_state"
+        ]
+        for table in content_tables:
+            cursor.execute(f"DELETE FROM {table} WHERE user_phone = ?", (phone,))
+            total_deleted += cursor.rowcount
+
+        conn.commit()
+        logger.info(f"Wiped {total_deleted} rows for {phone}; {len(media_paths)} media files to delete.")
+        return total_deleted, media_paths
+
+
+def extend_entry_description(section: str, entry_id: int, user_phone: str, extension_text: str) -> bool:
+    """
+    Appends extension_text to an existing entry's description field.
+    Creates the description field if it was previously NULL.
+    Returns True on success.
+    """
+    table_map = {
+        "idea": "ideas", "note": "notes",
+        "resource": "resources", "dump": "dumps"
+    }
+    table = table_map.get(section)
+    if not table:
+        return False
+
+    separator = "\n\n──────────── Extension ────────────\n"
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT description FROM {table} WHERE id = ? AND user_phone = ?",
+            (entry_id, user_phone)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+
+        existing = row["description"] or ""
+        new_desc = (existing + separator + extension_text) if existing else (separator.strip() + "\n" + extension_text)
+
+        cursor.execute(
+            f"UPDATE {table} SET description = ? WHERE id = ? AND user_phone = ?",
+            (new_desc, entry_id, user_phone)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+
 def is_admin_phone(phone: str) -> bool:
     """Returns True if the given phone is the admin."""
     phone_clean = phone.split("@")[0]

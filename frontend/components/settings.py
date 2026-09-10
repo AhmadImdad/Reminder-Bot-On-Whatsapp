@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import io
 import zipfile
-import sqlite3
 import sys
 import config_dashboard
 
@@ -240,28 +239,53 @@ def render():
         st.divider()
 
         # ── Danger Zone ───────────────────────────────────────────────────
-        st.subheader("Danger Zone")
+        st.subheader("🚨 Danger Zone")
+        st.caption(
+            "Permanently deletes **all content** for a selected user "
+            "(ideas, notes, resources, dumps, reminders, tasks, all media files). "
+            "Their account stays active — they can still use the bot."
+        )
 
-        if st.button("🗑️ Reset Database", type="primary"):
-            st.session_state.confirm_reset = True
+        users_df_dz = dq.get_all_allowed_users()
+        non_admin_df = users_df_dz[users_df_dz["is_admin"] != 1] if not users_df_dz.empty else users_df_dz
 
-        if st.session_state.get('confirm_reset', False):
-            st.error("⚠️ Are you absolutely sure? This will delete all reminders and messages permanently!")
-            c1, c2 = st.columns(2)
-            if c1.button("Yes, erase everything"):
-                try:
-                    conn = sqlite3.connect(config_dashboard.DB_PATH)
-                    c = conn.cursor()
-                    c.execute("DELETE FROM reminders")
-                    c.execute("DELETE FROM messages")
-                    c.execute("DELETE FROM conversation_state")
-                    conn.commit()
-                    conn.close()
-                    st.success("Database erased.")
-                    st.session_state.confirm_reset = False
-                except Exception as e:
-                    st.error(f"Failed: {e}")
+        if non_admin_df.empty:
+            st.info("No non-admin users to wipe.")
+        else:
+            phone_options = [
+                f"{row['phone']}  ({row['label'] or 'no label'})"
+                for _, row in non_admin_df.iterrows()
+            ]
+            selected_label = st.selectbox(
+                "Select user to wipe content for:",
+                options=phone_options,
+                key="wipe_user_select"
+            )
+            selected_phone = selected_label.split()[0]  # extract phone number
 
-            if c2.button("No, cancel"):
-                st.session_state.confirm_reset = False
+            if st.button("🗑️ Wipe All Content", type="primary", key="wipe_content_btn"):
+                st.session_state.confirm_wipe = True
+                st.session_state.wipe_phone   = selected_phone
                 st.rerun()
+
+            if st.session_state.get("confirm_wipe") and st.session_state.get("wipe_phone") == selected_phone:
+                st.error(
+                    f"⚠️ Are you absolutely sure? This will permanently delete **all content** "
+                    f"for **{selected_phone}** — including all media files on disk. "
+                    f"The account will remain active."
+                )
+                w1, w2 = st.columns(2)
+                if w1.button("✅ Yes, wipe everything", key="confirm_wipe_yes"):
+                    with st.spinner("Wiping content..."):
+                        ok, msg, count = dq.wipe_user_content(selected_phone)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                    st.session_state.confirm_wipe = False
+                    st.session_state.wipe_phone   = None
+                    st.rerun()
+                if w2.button("❌ No, cancel", key="confirm_wipe_no"):
+                    st.session_state.confirm_wipe = False
+                    st.session_state.wipe_phone   = None
+                    st.rerun()

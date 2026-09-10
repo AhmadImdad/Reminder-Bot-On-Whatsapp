@@ -9,3 +9,4 @@ httpx==0.28.1
 google-genai>=2.22.0
 streamlit
 streamlit-authenticator
+Pillow>=10.0.0

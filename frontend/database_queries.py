@@ -497,3 +497,101 @@ def delete_dump_by_id(dump_id: int) -> None:
         conn.execute("DELETE FROM attachments WHERE section = 'dump' AND entry_id = ?", (dump_id,))
         conn.execute("DELETE FROM dumps WHERE id = ?", (dump_id,))
         conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WIPE USER CONTENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def wipe_user_content(phone: str) -> tuple[bool, str, int]:
+    """
+    Wipes ALL content for a user (ideas, notes, resources, dumps, reminders, tasks,
+    attachments, temp_media, messages, conversation_state) but KEEPS the account.
+    Also deletes associated media files from disk.
+
+    Returns: (success, message, rows_deleted)
+    """
+    import os
+    import sys
+
+    # Pull BASE_DIR from config_dashboard so file resolution matches the backend
+    try:
+        import config_dashboard
+        base_dir = config_dashboard.BASE_DIR
+    except Exception:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Collect all media paths before deleting
+            media_paths = []
+            for table, col in [("ideas", "media_path"), ("notes", "media_path"),
+                                ("resources", "media_path"), ("dumps", "media_path")]:
+                try:
+                    cursor.execute(
+                        f"SELECT {col} FROM {table} WHERE user_phone = ? AND {col} IS NOT NULL",
+                        (phone,)
+                    )
+                    for row in cursor.fetchall():
+                        if row[0]:
+                            media_paths.append(row[0])
+                except Exception:
+                    pass
+
+            # Attachment paths
+            try:
+                cursor.execute(
+                    "SELECT media_path FROM attachments WHERE user_phone = ? AND media_path IS NOT NULL",
+                    (phone,)
+                )
+                for row in cursor.fetchall():
+                    if row[0]:
+                        media_paths.append(row[0])
+            except Exception:
+                pass
+
+            # Temp media paths
+            try:
+                cursor.execute(
+                    "SELECT file_path FROM temp_media WHERE user_phone = ? AND file_path IS NOT NULL",
+                    (phone,)
+                )
+                for row in cursor.fetchall():
+                    if row[0]:
+                        media_paths.append(row[0])
+            except Exception:
+                pass
+
+            # Delete all content rows
+            total_deleted = 0
+            content_tables = [
+                "ideas", "notes", "resources", "dumps",
+                "reminders", "tasks", "attachments", "temp_media",
+                "messages", "conversation_state"
+            ]
+            for table in content_tables:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE user_phone = ?", (phone,))
+                    total_deleted += cursor.rowcount
+                except Exception:
+                    pass
+
+            conn.commit()
+
+        # Delete files from disk
+        files_deleted = 0
+        for path in media_paths:
+            abs_path = path if os.path.isabs(path) else os.path.join(base_dir, path)
+            try:
+                if os.path.isfile(abs_path):
+                    os.remove(abs_path)
+                    files_deleted += 1
+            except Exception:
+                pass
+
+        return True, f"✅ Wiped {total_deleted} DB rows and {files_deleted} media file(s) for {phone}.", total_deleted
+
+    except Exception as e:
+        return False, f"❌ Wipe failed: {e}", 0
