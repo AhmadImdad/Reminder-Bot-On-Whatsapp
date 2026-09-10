@@ -66,9 +66,10 @@ def send_message(chat_id: str, message: str) -> bool:
             logger.info(f"Message sent successfully to {phone}")
             return True
         except requests.exceptions.RequestException as e:
+            err_body = f" | Response: {e.response.text}" if getattr(e, "response", None) is not None else ""
             logger.error(
                 f"Failed to send message to {phone}, "
-                f"attempt {attempt + 1}/{max_retries}: {e}"
+                f"attempt {attempt + 1}/{max_retries}: {e}{err_body}"
             )
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential back-off
@@ -168,7 +169,8 @@ def _upload_media(file_path: str, mime_type: str) -> Optional[str]:
         logger.info(f"Uploaded media, got media_id={media_id}")
         return media_id
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to upload media {file_path}: {e}")
+        err_body = f" | Response: {e.response.text}" if getattr(e, "response", None) is not None else ""
+        logger.error(f"Failed to upload media {file_path}: {e}{err_body}")
         return None
 
 
@@ -257,9 +259,10 @@ def send_file(chat_id: str, file_path: str, file_name: str) -> bool:
             logger.info(f"File sent successfully to {phone}: {file_name}")
             return True
         except requests.exceptions.RequestException as e:
+            err_body = f" | Response: {e.response.text}" if getattr(e, "response", None) is not None else ""
             logger.error(
                 f"Failed to send file to {phone}, "
-                f"attempt {attempt + 1}/{max_retries}: {e}"
+                f"attempt {attempt + 1}/{max_retries}: {e}{err_body}"
             )
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
