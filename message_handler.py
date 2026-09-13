@@ -16,6 +16,7 @@ from nlp_parser import (
     process_note_message,
     process_resource_message,
     process_dump_message,
+    parse_date_time_string,
 )
 from utils import format_datetime_for_user, local_to_utc, utc_to_local
 
@@ -54,6 +55,24 @@ def _resolve_media_path(media_path: str) -> str:
     return os.path.join(BASE_DIR, media_path)
 
 logger = logging.getLogger(__name__)
+
+# ── Save-session locked states ─────────────────────────────────────────────────
+# In any of these states the ONLY exit is ::abort.
+# Commands (::cmd ...) are silently blocked; the session keeps moving forward.
+LOCKED_SAVE_STATES = {
+    "awaiting_save_destination",
+    "awaiting_subject",
+    "awaiting_attach_section",
+    "awaiting_attach_entry",
+    "awaiting_attach_target",
+    "awaiting_task_deadline_confirm",
+    "awaiting_task_deadline_input",
+    "awaiting_reminder_time_confirm",
+    "awaiting_reminder_time_input",
+    "awaiting_both_confirm",
+    "awaiting_both_task_input",
+    "awaiting_both_reminder_input",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,13 +230,30 @@ def handle_incoming_webhook(data: Dict[str, Any]):
         state_data = database.get_conversation_state(chat_id)
         current_state = state_data["state"]
 
-        if current_state == "idle":
-            # Only evaluate commands when the user is in idle state
+        # ── Session lock ───────────────────────────────────────────────────────────
+        # In any active save session, only ::abort can exit.
+        # Any ::cmd attempt is blocked with a reminder to use ::abort first.
+        if current_state in LOCKED_SAVE_STATES:
             if message_type == "text":
-                text = message_data.get("text", {}).get("body", "").strip()
-                logger.info(f"Message text from {chat_id}: '{text}'")
-                if text and handle_commands(chat_id, text):
+                raw_text = message_data.get("text", {}).get("body", "").strip()
+                if raw_text == "::abort":
+                    ctx = state_data.get("context", {})
+                    batch_id = ctx.get("batch_id")
+                    if batch_id:
+                        _discard_batch(chat_id, batch_id)
+                    database.update_conversation_state(chat_id, "idle", {})
+                    green_api_client.send_message(chat_id, "🔴 Save session aborted.")
                     return
+                if raw_text.startswith("::cmd"):
+                    green_api_client.send_message(
+                        chat_id,
+                        "🔒 You're in an active save session.\n"
+                        "Type *::abort* to cancel it, then use your command."
+                    )
+                    return
+            # Fall through to normal state routing
+
+        if current_state == "idle":
             handle_idle_state(chat_id, message_data, message_type)
         elif current_state == "awaiting_confirmation":
             handle_confirmation_state(chat_id, message_data, message_type, state_data["context"])
@@ -234,6 +270,21 @@ def handle_incoming_webhook(data: Dict[str, Any]):
             handle_awaiting_attach_entry_state(chat_id, message_data, message_type, state_data["context"])
         elif current_state == "awaiting_attach_target":
             handle_awaiting_attach_target_state(chat_id, message_data, message_type, state_data["context"])
+        # ── Task / Reminder save-flow states ───────────────────────────────────────
+        elif current_state == "awaiting_task_deadline_confirm":
+            handle_awaiting_task_deadline_confirm_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_task_deadline_input":
+            handle_awaiting_task_deadline_input_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_reminder_time_confirm":
+            handle_awaiting_reminder_time_confirm_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_reminder_time_input":
+            handle_awaiting_reminder_time_input_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_both_confirm":
+            handle_awaiting_both_confirm_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_both_task_input":
+            handle_awaiting_both_task_input_state(chat_id, message_data, message_type, state_data["context"])
+        elif current_state == "awaiting_both_reminder_input":
+            handle_awaiting_both_reminder_input_state(chat_id, message_data, message_type, state_data["context"])
         # ── Multi-action selection state ──────────────────────────────────────────
         elif current_state == "awaiting_action_selection":
             handle_awaiting_action_selection_state(chat_id, message_data, message_type, state_data["context"])
@@ -570,7 +621,138 @@ def handle_commands(chat_id: str, text: str) -> bool:
         database.update_conversation_state(chat_id, "idle", {})
         return True
 
+    # ── HELP COMMAND ──────────────────────────────────────────────────────────
+    elif text_lower in ["help", "commands", "show commands", "what can you do"]:
+        help_msg = (
+            "📖 *Available Commands* (prefix every command with *::cmd*)\n\n"
+            "📋 *Viewing*\n"
+            "• `::cmd my tasks`  |  `::cmd pending tasks`  |  `::cmd completed tasks`\n"
+            "• `::cmd my reminders`\n"
+            "• `::cmd my ideas`  |  `::cmd my notes`  |  `::cmd my resources`  |  `::cmd my dumps`\n\n"
+            "🗑️ *Deleting*\n"
+            "• `::cmd delete task 3`\n"
+            "• `::cmd delete reminder 5`\n"
+            "• `::cmd delete idea 2`  |  `note`  |  `resource`  |  `dump`\n\n"
+            "📝 *Adding (via natural language)*\n"
+            "• `::cmd add task Buy groceries by tomorrow`\n"
+            "• `::cmd remind me to call mom on Friday at 5 PM`\n\n"
+            "🔴 *Session Control*\n"
+            "• `::abort` — cancel any active save session\n"
+        )
+        green_api_client.send_message(chat_id, help_msg)
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
+    # ── UNIVERSAL DELETE ──────────────────────────────────────────────────────
+    # Syntax: delete <type> <id>
+    # Types: task, reminder, idea, note, resource, dump
+    elif text_lower.startswith("delete "):
+        parts = text.strip().split()
+        if len(parts) >= 3 and parts[2].isdigit():
+            del_type = parts[1].lower()
+            del_id   = int(parts[2])
+            _execute_universal_delete(chat_id, del_type, del_id)
+        else:
+            green_api_client.send_message(
+                chat_id,
+                "Usage: *::cmd delete <type> <id>*\n\n"
+                "Types: *task*, *reminder*, *idea*, *note*, *resource*, *dump*\n"
+                "Example: *::cmd delete task 3*"
+            )
+        database.update_conversation_state(chat_id, "idle", {})
+        return True
+
+    # ── NLP FALLBACK ──────────────────────────────────────────────────────────
+    # Handles commands like "::cmd add task X by Friday" or
+    # "::cmd remind me to call mom at 5 PM tomorrow"
+    extracted_actions = process_natural_language_reminder(text)
+    valid_actions = [a for a in extracted_actions if a.get("intent", "none") != "none"]
+    if valid_actions:
+        _list_intents  = {"list_tasks", "list_pending_tasks", "list_completed_tasks", "list_reminders"}
+        _mutate_intents= {"remove_task", "complete_task", "add_task", "add_reminder"}
+
+        display_actions = [a for a in valid_actions if a.get("intent") in _list_intents]
+        mutate_actions  = [a for a in valid_actions if a.get("intent") in _mutate_intents]
+
+        for action in display_actions:
+            _execute_pipeline_action(chat_id, action)
+
+        if len(mutate_actions) == 1:
+            _execute_pipeline_action(chat_id, mutate_actions[0])
+        elif len(mutate_actions) > 1:
+            numbered = _format_action_list(mutate_actions)
+            database.update_conversation_state(chat_id, "awaiting_action_selection", {
+                "pending_actions": [dict(a) for a in mutate_actions]
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📨 I found *{len(mutate_actions)} requests* in your command:\n\n"
+                f"{numbered}\n\n"
+                f"Reply with the number(s) to execute — e.g. *1*, *1 2*, or *all*.\n"
+                f"Reply *cancel* to ignore."
+            )
+        else:
+            database.update_conversation_state(chat_id, "idle", {})
+        return True
+
     return False
+
+
+def _execute_universal_delete(chat_id: str, del_type: str, del_id: int) -> None:
+    """
+    Executes a universal delete for any entity type.
+    Dispatches to the appropriate database function.
+
+    For tasks, del_id is a 1-indexed list position (matching what the tasks table shows).
+    For all other types, del_id is the actual database row ID.
+    """
+    _TYPE_LABELS = {
+        "task":     "Task",
+        "reminder": "Reminder",
+        "idea":     "Idea",
+        "note":     "Note",
+        "resource": "Resource",
+        "dump":     "Dump",
+    }
+
+    if del_type not in _TYPE_LABELS:
+        green_api_client.send_message(
+            chat_id,
+            f"❌ Unknown type: *{del_type}*\n"
+            "Valid types: *task*, *reminder*, *idea*, *note*, *resource*, *dump*"
+        )
+        return
+
+    label = _TYPE_LABELS[del_type]
+    success = False
+
+    try:
+        if del_type == "task":
+            # Tasks are shown with 1-based list positions, not DB IDs
+            success = database.delete_task_by_offset(chat_id, del_id - 1)
+        elif del_type == "reminder":
+            success = database.cancel_reminder(del_id, chat_id)
+        elif del_type == "idea":
+            success = database.delete_idea(del_id, chat_id)
+        elif del_type == "note":
+            success = database.delete_note(del_id, chat_id)
+        elif del_type == "resource":
+            success = database.delete_resource(del_id, chat_id)
+        elif del_type == "dump":
+            success = database.delete_dump(del_id, chat_id)
+    except Exception as e:
+        logger.error(f"Universal delete error: type={del_type}, id={del_id}, error={e}")
+        success = False
+
+    if success:
+        green_api_client.send_message(chat_id, f"✅ {label} #{del_id} deleted.")
+    else:
+        green_api_client.send_message(
+            chat_id,
+            f"❌ Could not find {label} #{del_id}.\n"
+            f"Use *::cmd my {del_type}s* to see the current list."
+        )
+
 
 def extract_text_from_message(message_data: Dict[str, Any], message_type: str) -> str:
     """
@@ -712,79 +894,63 @@ def format_reminders_table(reminders: list) -> str:
     table += "```"
     return table
 
+
 def handle_idle_state(chat_id: str, message_data: Dict[str, Any], message_type: str):
-    """Processes message when bot is idle.
-    Media  → batch accumulation (15-second window, guided menu when ready).
-    Text   → commands first → then reminder/task NLP.
-             Single action: execute immediately with confirmation.
-             Multiple actions: list them and ask user to choose which ones.
-             Unrecognised: guided save offer.
     """
-    # ── MEDIA ────────────────────────────────────────────────────────────
-    if message_type in _SUPPORTED_MEDIA_TYPES:
+    Processes a message when the bot is idle.
+
+    Routing logic:
+      - ::cmd <text>   → command handler (NLP + static patterns).
+      - ::abort        → friendly "no session to abort" notice.
+      - Audio          → transcribe → echo → 9-option save menu.
+      - Text (no ::cmd)→ 9-option save menu (never the NLP pipeline).
+      - Other media    → batch accumulation (15-second window, existing flow).
+    """
+    # ── NON-AUDIO MEDIA ────────────────────────────────────────────────
+    if message_type in _SUPPORTED_MEDIA_TYPES and message_type != "audio":
         _handle_incoming_media(chat_id, message_data, message_type)
         return
 
-    # If a media batch is currently open for this user, any incoming text is stored
-    # as the caption/note for that batch instead of triggering a separate flow
+    # If a media batch is open, route text as caption (not a new message flow)
     open_batch_id = database.get_open_batch_for_user(chat_id)
-    if open_batch_id:
+    if open_batch_id and message_type != "audio":
         text = extract_text_from_message(message_data, message_type).strip()
         if text:
             database.update_batch_caption(open_batch_id, text)
             logger.info(f"Updated caption for open batch {open_batch_id}: '{text}'")
         return
 
-    # ── TEXT / AUDIO ────────────────────────────────────────────────────────────
+    # ── AUDIO / VOICE NOTE ──────────────────────────────────────────────
+    if message_type == "audio":
+        _handle_voice_note(chat_id, message_data)
+        return
+
+    # ── TEXT ───────────────────────────────────────────────────────────
     text = extract_text_from_message(message_data, message_type).strip()
     if not text:
-        # Silently ignore empty messages, reactions, or unsupported events
         logger.debug(f"Ignored empty/non-text event from {chat_id} (type={message_type})")
         return
 
-    # ── REMINDER / TASK NLP PIPELINE ────────────────────────────────────────
-    extracted_actions = process_natural_language_reminder(text)
-
-    # Filter only valid (non-none) actions with real intents
-    _list_intents   = {"list_tasks", "list_pending_tasks", "list_completed_tasks", "list_reminders"}
-    _modify_intents = {"remove_task", "complete_task", "add_task", "add_reminder"}
-    valid_actions   = [a for a in extracted_actions if a.get("intent", "none") != "none"]
-
-    if not valid_actions:
-        # Nothing the NLP understood — offer the guided save flow
-        _offer_text_save(chat_id, text)
+    # ── ::cmd keyword gate ────────────────────────────────────────────────────
+    # Commands ONLY fire when the user explicitly prefixes with ::cmd.
+    if text == "::abort":
+        green_api_client.send_message(chat_id, "ℹ️ No active save session to abort.")
         return
 
-    # Separate display actions (list_*) from mutating actions
-    display_actions = [a for a in valid_actions if a.get("intent") in _list_intents]
-    mutate_actions  = [a for a in valid_actions if a.get("intent") in _modify_intents]
-
-    # Handle display actions immediately (they're read-only, always fine)
-    for action in display_actions:
-        _execute_pipeline_action(chat_id, action)
-
-    if not mutate_actions:
-        # Only display actions — done
+    if text.startswith("::cmd"):
+        command_text = text[len("::cmd"):].strip()
+        logger.info(f"Command from {chat_id}: '{command_text}'")
+        if not handle_commands(chat_id, command_text):
+            green_api_client.send_message(
+                chat_id,
+                "\u2753 I couldn't understand that command.\n"
+                "Try *::cmd help* for a list of available commands."
+            )
         return
 
-    # ── Single mutating action → execute directly ────────────────────────────
-    if len(mutate_actions) == 1:
-        _execute_pipeline_action(chat_id, mutate_actions[0])
-        return
-
-    # ── Multiple mutating actions → ask user to choose ────────────────────────
-    numbered = _format_action_list(mutate_actions)
-    database.update_conversation_state(chat_id, "awaiting_action_selection", {
-        "pending_actions": [dict(a) for a in mutate_actions]
-    })
-    green_api_client.send_message(
-        chat_id,
-        f"📨 I received your message and it contains *{len(mutate_actions)} requests*:\n\n"
-        f"{numbered}\n\n"
-        f"Reply with the *number(s)* of the ones you want to execute — "
-        f"e.g. *1*, *2*, *1 2*, or *all*.\n"
-        f"Reply *cancel* to ignore all of them."
-    )
+    # No command prefix → always offer the 9-option save menu
+    logger.info(f"Plain text from {chat_id} (no ::cmd): '{text[:80]}'")
+    _offer_text_save_menu(chat_id, text)
 
 
 def _format_action_list(actions: list) -> str:
@@ -1032,23 +1198,84 @@ def handle_awaiting_datetime_state(chat_id: str, message_data: Dict[str, Any], m
 # TEMP MEDIA + MULTI-MEDIA ATTACHMENT HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _offer_text_save(chat_id: str, text: str) -> None:
-    """Offers the guided save menu for an unrecognised text message."""
+def _offer_text_save_menu(chat_id: str, text: str) -> None:
+    """
+    Shows the 9-option save menu for any plain text or transcribed audio.
+    Sets state to awaiting_save_destination with save_type='text'.
+    """
     preview = text[:80] + ("..." if len(text) > 80 else "")
     database.update_conversation_state(chat_id, "awaiting_save_destination", {
-        "text_content": text
+        "save_type":    "text",
+        "text_content": text,
     })
     green_api_client.send_message(
         chat_id,
-        f"💬 I received your message:\n“{preview}”\n\n"
+        f"💬 I received your message:\n\u201c{preview}\u201d\n\n"
         "What should I do with it?\n"
-        "1️⃣ Save as Idea\n"
-        "2️⃣ Save as Note\n"
-        "3️⃣ Save as Resource\n"
-        "4️⃣ Save as Dump\n"
-        "5️⃣ Attach to existing element\n"
-        "6️⃣ Ignore"
+        "1️⃣ Save as Task\n"
+        "2️⃣ Save as Reminder\n"
+        "3️⃣ Save as Task + Reminder\n"
+        "4️⃣ Save as Idea\n"
+        "5️⃣ Save as Note\n"
+        "6️⃣ Save as Resource\n"
+        "7️⃣ Save as Dump\n"
+        "8️⃣ Attach to existing element\n"
+        "9️⃣ Ignore\n\n"
+        "_Type ::abort to cancel this session._"
     )
+
+
+def _handle_voice_note(chat_id: str, message_data: Dict[str, Any]) -> None:
+    """
+    Handles incoming audio / voice-note messages:
+    1. Downloads via media_id to a temp file.
+    2. Transcribes using Groq Whisper (Gemini fallback).
+    3. Echoes the transcription back to the user.
+    4. Shows the same 9-option save menu so the user can decide what to do
+       with the transcribed text.
+    """
+    import tempfile
+    media_obj = message_data.get("audio", {})
+    media_id  = media_obj.get("id", "")
+    if not media_id:
+        green_api_client.send_message(
+            chat_id, "⚠️ Could not process voice note — no media ID found."
+        )
+        return
+
+    temp_dir  = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, f"voice_{uuid.uuid4().hex}.ogg")
+    try:
+        if not green_api_client.download_file(media_id, file_path):
+            green_api_client.send_message(
+                chat_id, "⚠️ Could not download your voice note. Please try again."
+            )
+            return
+        transcription = groq_client.transcribe_audio(file_path)
+    finally:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
+    if not transcription or not transcription.strip():
+        green_api_client.send_message(
+            chat_id,
+            "⚠️ Could not transcribe your voice note. "
+            "Please try again or send a text message."
+        )
+        return
+
+    transcription = transcription.strip()
+    # Echo transcription back to the user
+    green_api_client.send_message(
+        chat_id,
+        f"🎤 *Voice note transcription:*\n\n_{transcription}_"
+    )
+    # Show the same 9-option save menu
+    _offer_text_save_menu(chat_id, transcription)
+
 
 
 def _handle_incoming_media(chat_id: str, message_data: Dict[str, Any], message_type: str):
@@ -1303,7 +1530,6 @@ def handle_awaiting_save_destination_state(
     # If more media arrives, silently accumulate
     if message_type in _SUPPORTED_MEDIA_TYPES:
         _handle_incoming_media(chat_id, message_data, message_type)
-        # Update file list in message
         batch_id = context.get("batch_id")
         if batch_id:
             rows = database.get_batch_media(batch_id, chat_id)
@@ -1318,14 +1544,75 @@ def handle_awaiting_save_destination_state(
             )
         return
 
-    text    = extract_text_from_message(message_data, message_type).strip()
-    choice  = text.strip()
-    batch_id      = context.get("batch_id")
-    text_content  = context.get("text_content", "")
-    text_caption  = context.get("text_caption", "")
-    description   = text_content or text_caption  # whichever is set
+    text         = extract_text_from_message(message_data, message_type).strip()
+    choice       = text.strip()
+    save_type    = context.get("save_type", "media")   # "text" for text/voice, "media" for batches
+    batch_id     = context.get("batch_id")
+    text_content = context.get("text_content", "")
+    text_caption = context.get("text_caption", "")
+    description  = text_content or text_caption
 
-    # ── Discard / Cancel ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # TEXT SAVE FLOW  (9-option menu)
+    # ══════════════════════════════════════════════════════════════════════
+    if save_type == "text":
+        if choice == "9":   # Ignore
+            database.update_conversation_state(chat_id, "idle", {})
+            green_api_client.send_message(chat_id, "✅ Got it — message ignored.")
+            return
+
+        if choice == "8":   # Attach to existing
+            database.update_conversation_state(chat_id, "awaiting_attach_section", {
+                "save_type":    "text",
+                "text_content": text_content,
+            })
+            green_api_client.send_message(
+                chat_id,
+                "Which section would you like to attach this text to?\n\n"
+                "1️⃣ Idea\n2️⃣ Note\n3️⃣ Resource\n4️⃣ Dump\n\n"
+                "Reply with a number (1–4). Type *::abort* to cancel."
+            )
+            return
+
+        if choice in ("1", "2", "3"):   # Task / Reminder / Both
+            _start_task_reminder_flow(chat_id, choice, text_content)
+            return
+
+        section = _TEXT_SECTION_NUMBERS.get(choice)
+        if section:
+            database.update_conversation_state(chat_id, "awaiting_subject", {
+                "save_type":   "text",
+                "section":     section,
+                "description": text_content,
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 What should be the *subject* for this new {section}?\n"
+                f"Reply with a clear, meaningful title.\n\n"
+                f"_Type ::abort to cancel._"
+            )
+            return
+
+        # Invalid choice
+        green_api_client.send_message(
+            chat_id,
+            "⚠️ Please reply with a number from *1* to *9*:\n\n"
+            "1️⃣ Save as Task\n"
+            "2️⃣ Save as Reminder\n"
+            "3️⃣ Save as Task + Reminder\n"
+            "4️⃣ Save as Idea\n"
+            "5️⃣ Save as Note\n"
+            "6️⃣ Save as Resource\n"
+            "7️⃣ Save as Dump\n"
+            "8️⃣ Attach to existing element\n"
+            "9️⃣ Ignore\n\n"
+            "_Type ::abort to cancel this session._"
+        )
+        return
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MEDIA BATCH SAVE FLOW  (6-option menu — unchanged)
+    # ══════════════════════════════════════════════════════════════════════
     if choice.lower() in ("6", "discard", "ignore", "no", "cancel"):
         if batch_id:
             _discard_batch(chat_id, batch_id)
@@ -1333,7 +1620,6 @@ def handle_awaiting_save_destination_state(
         green_api_client.send_message(chat_id, "🗑️ Discarded. Nothing was saved.")
         return
 
-    # ── Attach to existing ────────────────────────────────────────────────
     if choice == "5":
         database.update_conversation_state(chat_id, "awaiting_attach_section", {
             "batch_id":     batch_id,
@@ -1343,16 +1629,11 @@ def handle_awaiting_save_destination_state(
         green_api_client.send_message(
             chat_id,
             "Which section would you like to attach to?\n\n"
-            "1️⃣ Idea\n"
-            "2️⃣ Note\n"
-            "3️⃣ Resource\n"
-            "4️⃣ Dump\n"
-            "5️⃣ Cancel\n\n"
-            "Reply with a number (1–4), or reply *cancel* to discard."
+            "1️⃣ Idea\n2️⃣ Note\n3️⃣ Resource\n4️⃣ Dump\n\n"
+            "Reply with a number (1–4), or type *::abort* to cancel."
         )
         return
 
-    # ── New section (1–4) ───────────────────────────────────────────────────
     section = _SECTION_NUMBERS.get(choice)
     if section:
         database.update_conversation_state(chat_id, "awaiting_subject", {
@@ -1363,22 +1644,150 @@ def handle_awaiting_save_destination_state(
         green_api_client.send_message(
             chat_id,
             f"📝 What should be the *subject* for this new {section}?\n"
-            f"Reply with a clear, meaningful title (e.g. \"Trip expenses\")."
+            f"Reply with a clear, meaningful title (e.g. \"Trip expenses\").\n\n"
+            f"_Type ::abort to cancel._"
         )
         return
 
-    # ── Invalid input ───────────────────────────────────────────────────────
-    # Maintain active saving session rigidly without executing commands or losing state
     green_api_client.send_message(
         chat_id,
         "⚠️ Please reply with a valid number from *1* to *6*:\n\n"
-        "1️⃣ Idea\n"
-        "2️⃣ Note\n"
-        "3️⃣ Resource\n"
-        "4️⃣ Dump\n"
-        "5️⃣ Attach to existing element\n"
-        "6️⃣ Discard (Cancel)"
+        "1️⃣ Idea\n2️⃣ Note\n3️⃣ Resource\n4️⃣ Dump\n"
+        "5️⃣ Attach to existing element\n6️⃣ Discard (Cancel)"
     )
+
+
+# ── Text-save section numbers (options 4–7 of the 9-option menu) ──────────────
+_TEXT_SECTION_NUMBERS = {"4": "idea", "5": "note", "6": "resource", "7": "dump"}
+
+
+def _start_task_reminder_flow(chat_id: str, choice: str, text_content: str) -> None:
+    """
+    Starts the task / reminder save flow (menu options 1, 2, 3).
+    Tries to extract a deadline / reminder time from text_content via NLP,
+    then asks the user to confirm (or enter manually if not found).
+    """
+    from utils import utc_to_local
+    now_local_str = utc_to_local(datetime.utcnow()).strftime("%A, %Y-%m-%d %H:%M:%S")
+
+    extracted  = groq_client.extract_task_reminder_times(text_content, now_local_str) or {}
+    task_desc  = (extracted.get("task_description") or text_content[:120]).strip()
+
+    def _parse_dt(info: dict):
+        """Parse a {date, time} dict returned by the LLM to a UTC datetime (or None)."""
+        if not info:
+            return None
+        try:
+            return parse_date_time_string(info["date"], info["time"])
+        except Exception:
+            return None
+
+    deadline_dt = _parse_dt(extracted.get("task_deadline"))
+    reminder_dt = _parse_dt(extracted.get("reminder_time"))
+
+    # ── Option 1: Task only ──────────────────────────────────────────────────
+    if choice == "1":
+        if deadline_dt:
+            database.update_conversation_state(chat_id, "awaiting_task_deadline_confirm", {
+                "task_desc":    task_desc,
+                "deadline_utc": deadline_dt.isoformat(),
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task:* _{task_desc}_\n\n"
+                f"I found this deadline: *{format_datetime_for_user(deadline_dt)}*\n"
+                f"Is this correct? Reply *YES* or *NO*."
+            )
+        else:
+            database.update_conversation_state(chat_id, "awaiting_task_deadline_input", {
+                "task_desc": task_desc,
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task:* _{task_desc}_\n\n"
+                f"When is the deadline?\n"
+                f"(e.g. *tomorrow at 6 PM*, *15 Sep 11 PM*, or *no deadline*)"
+            )
+
+    # ── Option 2: Reminder only ──────────────────────────────────────────────
+    elif choice == "2":
+        if reminder_dt:
+            database.update_conversation_state(chat_id, "awaiting_reminder_time_confirm", {
+                "task_desc":    task_desc,
+                "reminder_utc": reminder_dt.isoformat(),
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"⏰ *Reminder:* _{task_desc}_\n\n"
+                f"I found this reminder time: *{format_datetime_for_user(reminder_dt)}*\n"
+                f"Is this correct? Reply *YES* or *NO*."
+            )
+        else:
+            database.update_conversation_state(chat_id, "awaiting_reminder_time_input", {
+                "task_desc": task_desc,
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"⏰ *Reminder:* _{task_desc}_\n\n"
+                f"When should I remind you?\n"
+                f"(e.g. *tomorrow at 6 PM*, *Monday at 10 AM*)"
+            )
+
+    # ── Option 3: Task + Reminder ────────────────────────────────────────────
+    elif choice == "3":
+        if deadline_dt and reminder_dt:
+            # Both found — confirm together in one message
+            database.update_conversation_state(chat_id, "awaiting_both_confirm", {
+                "task_desc":    task_desc,
+                "deadline_utc": deadline_dt.isoformat(),
+                "reminder_utc": reminder_dt.isoformat(),
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task + Reminder:* _{task_desc}_\n\n"
+                f"📅 Task deadline: *{format_datetime_for_user(deadline_dt)}*\n"
+                f"⏰ Reminder time: *{format_datetime_for_user(reminder_dt)}*\n\n"
+                f"Are both correct? Reply *YES* or *NO*."
+            )
+        elif deadline_dt:
+            # Only deadline found — confirm deadline, then ask for reminder
+            database.update_conversation_state(chat_id, "awaiting_both_reminder_input", {
+                "task_desc":    task_desc,
+                "deadline_utc": deadline_dt.isoformat(),
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task + Reminder:* _{task_desc}_\n"
+                f"📅 Task deadline: *{format_datetime_for_user(deadline_dt)}* ✅\n\n"
+                f"⏰ When should I remind you?\n"
+                f"(e.g. *tomorrow at 9 AM*, *Monday 10 AM*)"
+            )
+        elif reminder_dt:
+            # Only reminder found — ask for task deadline
+            database.update_conversation_state(chat_id, "awaiting_both_task_input", {
+                "task_desc":    task_desc,
+                "reminder_utc": reminder_dt.isoformat(),
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task + Reminder:* _{task_desc}_\n"
+                f"⏰ Reminder time: *{format_datetime_for_user(reminder_dt)}* ✅\n\n"
+                f"📅 When is the task deadline?\n"
+                f"(e.g. *15 Sep*, *next Friday*, or *no deadline*)"
+            )
+        else:
+            # Neither found — ask for deadline first
+            database.update_conversation_state(chat_id, "awaiting_both_task_input", {
+                "task_desc":    task_desc,
+                "reminder_utc": None,
+            })
+            green_api_client.send_message(
+                chat_id,
+                f"📝 *Task + Reminder:* _{task_desc}_\n\n"
+                f"📅 When is the task deadline?\n"
+                f"(e.g. *tomorrow at 6 PM*, or *no deadline*)"
+            )
+
 
 
 def _is_valid_subject(subject: str) -> bool:
@@ -1411,20 +1820,13 @@ def handle_awaiting_subject_state(
     section     = context.get("section")
     description = context.get("description", "")
 
-    if text.lower() in ("discard", "cancel"):
-        if batch_id:
-            _discard_batch(chat_id, batch_id)
-        database.update_conversation_state(chat_id, "idle", {})
-        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
-        return
-
     subject = text
     if not _is_valid_subject(subject):
         green_api_client.send_message(
             chat_id,
             "That doesn't look like a clear subject. "
-            "Please reply with a proper title (e.g. \"Product launch photos\")\n"
-            "Or reply *discard* to cancel."
+            "Please reply with a proper title (e.g. \"Product launch photos\").\n"
+            "_Type ::abort to cancel the session._"
         )
         return  # keep state, ask again
 
@@ -1492,13 +1894,6 @@ def handle_awaiting_attach_section_state(
     text_content = context.get("text_content", "")
     text_caption = context.get("text_caption", "")
 
-    if text.lower() in ("5", "cancel", "discard"):
-        if batch_id:
-            _discard_batch(chat_id, batch_id)
-        database.update_conversation_state(chat_id, "idle", {})
-        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
-        return
-
     section = _SECTION_NUMBERS.get(text.lower())
     if not section and text.lower() in ("idea", "note", "resource", "dump"):
         section = text.lower()
@@ -1507,11 +1902,8 @@ def handle_awaiting_attach_section_state(
         green_api_client.send_message(
             chat_id,
             "⚠️ Please reply with a valid number (1–4) for the section:\n\n"
-            "1️⃣ Idea\n"
-            "2️⃣ Note\n"
-            "3️⃣ Resource\n"
-            "4️⃣ Dump\n"
-            "5️⃣ Cancel"
+            "1️⃣ Idea\n2️⃣ Note\n3️⃣ Resource\n4️⃣ Dump\n\n"
+            "_Type ::abort to cancel._"
         )
         return
 
@@ -1554,7 +1946,8 @@ def handle_awaiting_attach_section_state(
         chat_id,
         f"Select the *{section.capitalize()}* you want to attach to:\n\n"
         f"{list_text}\n\n"
-        f"Reply with a number (e.g. *1* or *2*), or reply *cancel* to discard."
+        f"Reply with a number (e.g. *1* or *2*)."
+        f"\n_Type ::abort to cancel._"
     )
 
 
@@ -1579,13 +1972,6 @@ def handle_awaiting_attach_entry_state(
     section = context.get("section")
     entry_ids = context.get("entry_ids", [])
     entry_subjects = context.get("entry_subjects", [])
-
-    if text.lower() in ("cancel", "discard"):
-        if batch_id:
-            _discard_batch(chat_id, batch_id)
-        database.update_conversation_state(chat_id, "idle", {})
-        green_api_client.send_message(chat_id, "🗑️ Cancelled. Nothing was saved.")
-        return
 
     valid_idx = None
     if text.isdigit():
@@ -1766,6 +2152,246 @@ def _execute_batch_intent(user_phone: str, intent_result: dict,
         return True
 
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK / REMINDER SAVE-FLOW STATE HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_YES_WORDS = {"yes", "y", "yeah", "yep", "correct", "sure", "ok", "okay", "yup", "right"}
+_NO_WORDS  = {"no",  "n", "nope", "incorrect", "wrong", "nah"}
+
+
+def _parse_datetime_from_text(text: str, task_desc: str) -> Optional[datetime]:
+    """
+    Tries to parse a user-typed date/time string through the NLP pipeline.
+    Returns a UTC datetime or None if parsing fails.
+    """
+    combined = f"{task_desc}. When: {text}"
+    actions  = process_natural_language_reminder(combined)
+    for a in (actions or []):
+        raw = a.get("parsed_datetime_utc")
+        if raw:
+            try:
+                return datetime.fromisoformat(raw)
+            except Exception:
+                pass
+    return None
+
+
+def handle_awaiting_task_deadline_confirm_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User confirms the deadline extracted from their original message (YES / NO)."""
+    text             = extract_text_from_message(message_data, message_type).strip().lower()
+    task_desc        = context.get("task_desc", "")
+    deadline_utc_str = context.get("deadline_utc")
+
+    if text in _YES_WORDS:
+        dt = datetime.fromisoformat(deadline_utc_str)
+        database.add_task(chat_id, task_desc, dt)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Task saved!*\n📝 *{task_desc}*\n📅 *Deadline:* {format_datetime_for_user(dt)}"
+        )
+    elif text in _NO_WORDS:
+        database.update_conversation_state(chat_id, "awaiting_task_deadline_input", {
+            "task_desc": task_desc,
+        })
+        green_api_client.send_message(
+            chat_id,
+            f"📅 When is the deadline for *{task_desc}*?\n"
+            f"(e.g. *tomorrow at 6 PM*, *15 Sep*, or *no deadline*)"
+        )
+    else:
+        green_api_client.send_message(chat_id, "Please reply *YES* or *NO* to confirm the deadline.")
+
+
+def handle_awaiting_task_deadline_input_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User types the task deadline manually."""
+    text      = extract_text_from_message(message_data, message_type).strip()
+    task_desc = context.get("task_desc", "")
+
+    _NO_DEADLINE = {"no deadline", "no date", "none", "skip", "without deadline", "no due date"}
+    if text.lower() in _NO_DEADLINE:
+        database.add_task(chat_id, task_desc, None)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Task saved* (no deadline)!\n📝 *{task_desc}*"
+        )
+        return
+
+    dt = _parse_datetime_from_text(text, task_desc)
+    if dt:
+        database.add_task(chat_id, task_desc, dt)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Task saved!*\n📝 *{task_desc}*\n📅 *Deadline:* {format_datetime_for_user(dt)}"
+        )
+    else:
+        green_api_client.send_message(
+            chat_id,
+            "I couldn't understand that date. Please try again:\n"
+            "e.g. *tomorrow at 6 PM*, *15 Sep 2 PM*, *next Monday*\n"
+            "Or reply *no deadline* to save without one."
+        )
+
+
+def handle_awaiting_reminder_time_confirm_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User confirms the reminder time extracted from their original message (YES / NO)."""
+    text             = extract_text_from_message(message_data, message_type).strip().lower()
+    task_desc        = context.get("task_desc", "")
+    reminder_utc_str = context.get("reminder_utc")
+
+    if text in _YES_WORDS:
+        dt = datetime.fromisoformat(reminder_utc_str)
+        database.add_reminder(chat_id, task_desc, dt)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Reminder set!*\n⏰ *{task_desc}*\n📅 *{format_datetime_for_user(dt)}*"
+        )
+    elif text in _NO_WORDS:
+        database.update_conversation_state(chat_id, "awaiting_reminder_time_input", {
+            "task_desc": task_desc,
+        })
+        green_api_client.send_message(
+            chat_id,
+            f"⏰ When should I remind you about *{task_desc}*?\n"
+            f"(e.g. *tomorrow at 6 PM*, *Monday 10 AM*)"
+        )
+    else:
+        green_api_client.send_message(chat_id, "Please reply *YES* or *NO* to confirm the reminder time.")
+
+
+def handle_awaiting_reminder_time_input_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User types the reminder time manually."""
+    text      = extract_text_from_message(message_data, message_type).strip()
+    task_desc = context.get("task_desc", "")
+
+    dt = _parse_datetime_from_text(text, task_desc)
+    if dt:
+        database.add_reminder(chat_id, task_desc, dt)
+        database.update_conversation_state(chat_id, "idle", {})
+        green_api_client.send_message(
+            chat_id,
+            f"✅ *Reminder set!*\n⏰ *{task_desc}*\n📅 *{format_datetime_for_user(dt)}*"
+        )
+    else:
+        green_api_client.send_message(
+            chat_id,
+            "I couldn't understand that time. Please try again:\n"
+            "e.g. *tomorrow at 6 PM*, *Monday at 10 AM*, *15 Sep 9 AM*"
+        )
+
+
+def handle_awaiting_both_confirm_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User confirms BOTH task deadline AND reminder time together (YES / NO)."""
+    text             = extract_text_from_message(message_data, message_type).strip().lower()
+    task_desc        = context.get("task_desc", "")
+    deadline_utc_str = context.get("deadline_utc")
+    reminder_utc_str = context.get("reminder_utc")
+
+    if text in _YES_WORDS:
+        deadline_dt = datetime.fromisoformat(deadline_utc_str) if deadline_utc_str else None
+        reminder_dt = datetime.fromisoformat(reminder_utc_str) if reminder_utc_str else None
+        if deadline_dt:
+            database.add_task(chat_id, task_desc, deadline_dt)
+        if reminder_dt:
+            database.add_reminder(chat_id, task_desc, reminder_dt)
+        database.update_conversation_state(chat_id, "idle", {})
+        msg = f"✅ *Saved!*\n📝 *Task:* {task_desc}"
+        if deadline_dt:
+            msg += f"\n📅 *Deadline:* {format_datetime_for_user(deadline_dt)}"
+        if reminder_dt:
+            msg += f"\n⏰ *Reminder:* {format_datetime_for_user(reminder_dt)}"
+        green_api_client.send_message(chat_id, msg)
+
+    elif text in _NO_WORDS:
+        database.update_conversation_state(chat_id, "awaiting_both_task_input", {
+            "task_desc":    task_desc,
+            "reminder_utc": None,
+        })
+        green_api_client.send_message(
+            chat_id,
+            f"Let's re-enter them.\n\n"
+            f"📅 When is the task deadline for *{task_desc}*?\n"
+            f"(e.g. *tomorrow at 6 PM*, or *no deadline*)"
+        )
+    else:
+        green_api_client.send_message(chat_id, "Please reply *YES* or *NO* to confirm both times.")
+
+
+def handle_awaiting_both_task_input_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User types the task deadline in the Task + Reminder flow."""
+    text         = extract_text_from_message(message_data, message_type).strip()
+    task_desc    = context.get("task_desc", "")
+    reminder_utc = context.get("reminder_utc")
+
+    _NO_DEADLINE = {"no deadline", "no date", "none", "skip", "without deadline", "no due date"}
+    deadline_dt  = None
+    if text.lower() not in _NO_DEADLINE:
+        deadline_dt = _parse_datetime_from_text(text, task_desc)
+        if not deadline_dt:
+            green_api_client.send_message(
+                chat_id,
+                "I couldn't understand that date. Please try again:\n"
+                "e.g. *tomorrow at 6 PM*, *15 Sep*, or *no deadline* to skip."
+            )
+            return
+
+    database.update_conversation_state(chat_id, "awaiting_both_reminder_input", {
+        "task_desc":    task_desc,
+        "deadline_utc": deadline_dt.isoformat() if deadline_dt else None,
+    })
+    deadline_str = f"*{format_datetime_for_user(deadline_dt)}*" if deadline_dt else "no deadline"
+    green_api_client.send_message(
+        chat_id,
+        f"📅 Task deadline: {deadline_str} ✅\n\n"
+        f"⏰ When should I remind you about *{task_desc}*?\n"
+        f"(e.g. *tomorrow at 9 AM*, *Monday 10 AM*)"
+    )
+
+
+def handle_awaiting_both_reminder_input_state(
+        chat_id: str, message_data: Dict[str, Any],
+        message_type: str, context: Dict[str, Any]):
+    """User types the reminder time in the Task + Reminder flow. Saves both."""
+    text             = extract_text_from_message(message_data, message_type).strip()
+    task_desc        = context.get("task_desc", "")
+    deadline_utc_str = context.get("deadline_utc")
+
+    reminder_dt = _parse_datetime_from_text(text, task_desc)
+    if not reminder_dt:
+        green_api_client.send_message(
+            chat_id,
+            "I couldn't understand that time. Please try again:\n"
+            "e.g. *tomorrow at 9 AM*, *Monday 10 AM*, *15 Sep 8 AM*"
+        )
+        return
+
+    deadline_dt = datetime.fromisoformat(deadline_utc_str) if deadline_utc_str else None
+    database.add_task(chat_id, task_desc, deadline_dt)
+    database.add_reminder(chat_id, task_desc, reminder_dt)
+    database.update_conversation_state(chat_id, "idle", {})
+
+    msg = f"✅ *Saved!*\n📝 *Task:* {task_desc}"
+    msg += f"\n📅 *Deadline:* {format_datetime_for_user(deadline_dt)}" if deadline_dt else "\n📅 No deadline"
+    msg += f"\n⏰ *Reminder:* {format_datetime_for_user(reminder_dt)}"
+    green_api_client.send_message(chat_id, msg)
 
 
 def handle_awaiting_batch_subject_state(chat_id: str, message_data: Dict[str, Any],

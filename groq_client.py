@@ -409,3 +409,53 @@ Examples:
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse media caption intent JSON: {e}")
         return None
+
+
+# ── NLP: extract task deadline + reminder time ────────────────────────────────
+
+def extract_task_reminder_times(text: str, current_time: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts task deadline and/or reminder time from a plain text message.
+    Used by the save-menu task/reminder flow to pre-fill confirmation questions.
+
+    Returns:
+    {
+        "task_description": str | null,
+        "task_deadline":    {"date": "YYYY-MM-DD", "time": "HH:MM"} | null,
+        "reminder_time":    {"date": "YYYY-MM-DD", "time": "HH:MM"} | null
+    }
+    """
+    prompt = f"""
+You are an AI that extracts task deadlines and reminder times from user messages.
+Current Date and Time: {current_time}
+
+Message: "{text}"
+
+Extract the following:
+1. task_description — the core action/task (stripped of time/date references)
+2. task_deadline    — a date + time the task is due (null if not mentioned)
+3. reminder_time   — a date + time the user wants to be reminded (null if not mentioned)
+
+Rules:
+- Use 24-hour format for time (e.g. 5 PM → 17:00).
+- If only a date is mentioned for a deadline (no time), use "23:59".
+- If only a date is mentioned for a reminder (no time), use "09:00".
+- Calculate relative expressions (e.g. "tomorrow", "next Friday") using the Current Date and Time.
+- If neither deadline nor reminder time is mentioned, return null for both.
+- task_description should be concise and clear (e.g. "Call mom", "Submit report").
+
+Respond ONLY with valid JSON matching this exact schema, no extra text:
+{{
+    "task_description": string or null,
+    "task_deadline":    {{"date": "YYYY-MM-DD", "time": "HH:MM"}} or null,
+    "reminder_time":    {{"date": "YYYY-MM-DD", "time": "HH:MM"}} or null
+}}
+"""
+    raw = _gemini_json(prompt, max_tokens=256)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse task/reminder times JSON: {e} | raw={raw[:200]}")
+        return None
