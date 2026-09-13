@@ -3,7 +3,8 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
 
 import database
 import meta_api_client as green_api_client  # drop-in replacement for Green API
